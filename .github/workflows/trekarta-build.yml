@@ -1,0 +1,571 @@
+name: Build Trekarta + Generate Nepal Maps
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      regions:
+        description: 'Geofabrik region paths (comma-separated, e.g. asia/nepal,asia/india)'
+        required: false
+        default: 'asia/nepal'
+
+env:
+  MAP_TARGET_PATH: ${{ github.workspace }}/maps-output/maps
+  HILLSHADE_PATH: ${{ github.workspace }}/maps-output/hillshades
+  DATA_PATH: ${{ github.workspace }}/gis-data
+  MAPCREATOR_PATH: ${{ github.workspace }}/mapcreator
+  YOUR_SERVER_HOST: your-server-hostname.com   # <-- CHANGE THIS to your domain or IP
+
+jobs:
+  # ============================================================
+  # JOB 1: Generate .mtiles map files from OSM data
+  # ============================================================
+  generate-maps:
+    name: Generate Map Tiles
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            osmium-tool \
+            osmctools \
+            python3-pip \
+            python3-dev \
+            libpq-dev \
+            sqlite3 \
+            --no-install-recommends
+
+      - name: Install Python dependencies
+        run: |
+          pip3 install \
+            psycopg2-binary \
+            osmium \
+            mercantile \
+            shapely \
+            psutil \
+            tqdm \
+            setproctitle \
+            protobuf
+
+      - name: Clone mapcreator
+        run: |
+          git clone --depth=1 https://github.com/andreynovikov/mapcreator.git ${{ env.MAPCREATOR_PATH }}
+
+      - name: Create directory structure
+        run: |
+          mkdir -p ${{ env.DATA_PATH }}
+          mkdir -p ${{ env.MAP_TARGET_PATH }}
+          mkdir -p ${{ env.HILLSHADE_PATH }}
+
+          # Create blank nativeindex (128*128 cells * 6 bytes + 6 bytes for basemap)
+          python3 -c "
+          with open('${{ env.MAP_TARGET_PATH }}/nativeindex', 'wb') as f:
+              f.write(b'\x00' * (128 * 128 * 6 + 6))
+          "
+
+      - name: Download OSM PBF data
+        run: |
+          REGIONS="${{ github.event.inputs.regions || 'asia/nepal' }}"
+          IFS=',' read -ra REGION_LIST <<< "$REGIONS"
+
+          for REGION in "${REGION_LIST[@]}"; do
+            REGION=$(echo "$REGION" | xargs)  # trim whitespace
+            FILENAME=$(basename "$REGION")
+            echo "Downloading $REGION..."
+            wget -q --show-progress \
+              "https://download.geofabrik.de/${REGION}-latest.osm.pbf" \
+              -O "${{ env.DATA_PATH }}/${FILENAME}-latest.osm.pbf"
+          done
+
+          # Merge all PBFs into one if multiple regions
+          PBFS=(${{ env.DATA_PATH }}/*-latest.osm.pbf)
+          if [ ${#PBFS[@]} -gt 1 ]; then
+            echo "Merging ${#PBFS[@]} PBF files..."
+            osmium merge "${PBFS[@]}" -o "${{ env.DATA_PATH }}/source.osm.pbf" --overwrite
+          else
+            cp "${PBFS[0]}" "${{ env.DATA_PATH }}/source.osm.pbf"
+          fi
+
+          ls -lh "${{ env.DATA_PATH }}/source.osm.pbf"
+
+      - name: Write mapcreator configuration
+        run: |
+          cat > ${{ env.MAPCREATOR_PATH }}/configuration.py << 'EOF'
+          #!/usr/bin/python3
+          import os
+
+          OSMCONVERT_PATH = '/usr/bin/osmconvert'
+          OSMFILTER_PATH  = '/usr/bin/osmfilter'
+
+          SOURCE_PBF          = os.environ['DATA_PATH'] + '/source.osm.pbf'
+          MAP_TARGET_PATH     = os.environ['MAP_TARGET_PATH']
+          LOGGING_PATH        = '/tmp/mapcreator-logs'
+          DATA_PATH           = os.environ['DATA_PATH']
+          DATA_DB_DSN         = 'dbname=gis'
+          FILTERS_PATH        = os.environ['MAPCREATOR_PATH'] + '/filters'
+          FROM_FILE           = True
+
+          MAP_DOWNLOAD_LOG    = '/tmp/maps.log'
+          STATS_DB_DSN        = 'dbname=gis'
+
+          HILLSHADE_VERSION   = 1
+          HILLSHADE_TILES_DB  = os.environ['DATA_PATH'] + '/hillshade.mbtiles'
+          HILLSHADE_TARGET_PATH = os.environ['HILLSHADE_PATH']
+          EOF
+
+          mkdir -p /tmp/mapcreator-logs
+
+      - name: Find tiles covering downloaded regions
+        id: find-tiles
+        run: |
+          python3 << 'EOF'
+          import mercantile
+          import osmium
+          import json
+          import os
+
+          data_path = os.environ['DATA_PATH']
+          pbf_path = data_path + '/source.osm.pbf'
+
+          # Get bounding box of the PBF file
+          class BboxHandler(osmium.SimpleHandler):
+              def __init__(self):
+                  super().__init__()
+                  self.min_lon = 180
+                  self.max_lon = -180
+                  self.min_lat = 90
+                  self.max_lat = -90
+
+              def node(self, n):
+                  self.min_lon = min(self.min_lon, n.location.lon)
+                  self.max_lon = max(self.max_lon, n.location.lon)
+                  self.min_lat = min(self.min_lat, n.location.lat)
+                  self.max_lat = max(self.max_lat, n.location.lat)
+
+          h = BboxHandler()
+          h.apply_file(pbf_path, locations=False)
+          print(f"PBF bbox: {h.min_lon:.4f},{h.min_lat:.4f},{h.max_lon:.4f},{h.max_lat:.4f}")
+
+          # Find all zoom-7 mercantile tiles covering this bbox
+          tiles = list(mercantile.tiles(h.min_lon, h.min_lat, h.max_lon, h.max_lat, zooms=7))
+          tile_list = [f"{t.x}-{t.y}" for t in tiles]
+          print(f"Tiles to generate ({len(tiles)}): {tile_list}")
+
+          # Write to file for next step
+          with open('/tmp/tiles_to_generate.json', 'w') as f:
+              json.dump(tile_list, f)
+
+          # Also write as GH output
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"tile_count={len(tiles)}\n")
+              f.write(f"tiles={','.join(tile_list)}\n")
+          EOF
+
+      - name: Generate .mtiles for each tile
+        run: |
+          cd ${{ env.MAPCREATOR_PATH }}
+
+          python3 << 'EOF'
+          import json
+          import subprocess
+          import sys
+          import os
+
+          with open('/tmp/tiles_to_generate.json') as f:
+              tiles = json.load(f)
+
+          mapcreator_path = os.environ['MAPCREATOR_PATH']
+          map_target_path = os.environ['MAP_TARGET_PATH']
+          data_path = os.environ['DATA_PATH']
+
+          failed = []
+          for tile in tiles:
+              x, y = tile.split('-')
+              x, y = int(x), int(y)
+
+              # Create output directory for this x
+              tile_dir = f"{map_target_path}/{x}"
+              os.makedirs(tile_dir, exist_ok=True)
+
+              print(f"\n{'='*50}")
+              print(f"Generating tile {x}-{y}...")
+              print(f"{'='*50}")
+
+              result = subprocess.run(
+                  [sys.executable, f"{mapcreator_path}/mapwrite.py",
+                   '--from-file',
+                   '--log', 'INFO',
+                   '--data-path', data_path,
+                   str(x), str(y)],
+                  capture_output=False,
+                  timeout=1800  # 30 min per tile max
+              )
+
+              if result.returncode != 0:
+                  print(f"WARNING: tile {x}-{y} failed with code {result.returncode}")
+                  failed.append(tile)
+              else:
+                  # mapwrite.py writes to data_path, move to correct location
+                  src = f"{data_path}/{x}-{y}.mtiles"
+                  dst = f"{tile_dir}/{x}-{y}.mtiles"
+                  if os.path.exists(src):
+                      os.rename(src, dst)
+                      size = os.path.getsize(dst)
+                      print(f"  OK: {dst} ({size/1024:.1f} KB)")
+                  else:
+                      print(f"  WARN: no output file for {x}-{y} (empty area?)")
+
+          if failed:
+              print(f"\nFailed tiles: {failed}")
+          else:
+              print(f"\nAll {len(tiles)} tiles generated successfully")
+          EOF
+
+      - name: Generate basemap
+        run: |
+          cd ${{ env.MAPCREATOR_PATH }}
+          python3 mapwrite.py \
+            --from-file \
+            --log INFO \
+            --data-path ${{ env.DATA_PATH }} \
+            -1 -1 || echo "Basemap generation failed (non-fatal)"
+
+          # Move basemap if generated
+          if [ -f "${{ env.DATA_PATH }}/basemap.mtiles" ]; then
+            mv "${{ env.DATA_PATH }}/basemap.mtiles" "${{ env.MAP_TARGET_PATH }}/basemap.mtiles"
+            echo "Basemap size: $(du -h ${{ env.MAP_TARGET_PATH }}/basemap.mtiles | cut -f1)"
+          else
+            echo "No basemap generated"
+          fi
+
+      - name: Generate binary index file
+        run: |
+          python3 << 'EOF'
+          import os
+          import sqlite3
+          import struct
+
+          map_target_path = os.environ['MAP_TARGET_PATH']
+
+          def mapinfo(x, y):
+              if x == -1 and y == -1:
+                  map_path = f"{map_target_path}/basemap.mtiles"
+              else:
+                  map_path = f"{map_target_path}/{x}/{x}-{y}.mtiles"
+
+              if not os.path.exists(map_path):
+                  return 0, 0
+
+              size = os.path.getsize(map_path)
+              if size == 0:
+                  return 0, 0
+
+              try:
+                  with sqlite3.connect(map_path) as db:
+                      cur = db.cursor()
+                      cur.execute("SELECT value FROM metadata WHERE name = 'timestamp'")
+                      row = cur.fetchone()
+                      date = int(row[0]) if row else 0
+                  return size, date
+              except Exception as e:
+                  print(f"  WARN: could not read metadata from {map_path}: {e}")
+                  return size, 0
+
+          index_path = f"{map_target_path}/index"
+          print(f"Generating binary index at {index_path}...")
+
+          tile_count = 0
+          with open(index_path, 'wb') as f:
+              for x in range(128):
+                  for y in range(128):
+                      size, date = mapinfo(x, y)
+                      f.write(struct.pack('>hI', date, size))
+                      if size > 0:
+                          tile_count += 1
+
+              # Basemap entry
+              size, date = mapinfo(-1, -1)
+              f.write(struct.pack('>hI', date, size))
+
+          index_size = os.path.getsize(index_path)
+          print(f"Index written: {index_size} bytes, {tile_count} non-empty tiles")
+
+          # Also generate a blank hillshade index
+          hillshade_path = os.environ['HILLSHADE_PATH']
+          os.makedirs(hillshade_path, exist_ok=True)
+          hillshade_index = f"{hillshade_path}/index"
+          with open(hillshade_index, 'wb') as f:
+              # byte version + int size per cell
+              for x in range(128):
+                  for y in range(128):
+                      f.write(struct.pack('>bI', 0, 0))
+          print(f"Blank hillshade index written")
+          EOF
+
+      - name: List generated files
+        run: |
+          echo "=== Maps output ==="
+          find ${{ env.MAP_TARGET_PATH }} -name "*.mtiles" | sort | while read f; do
+            echo "  $(du -h $f | cut -f1)  $f"
+          done
+          echo ""
+          echo "Index: $(du -h ${{ env.MAP_TARGET_PATH }}/index | cut -f1)"
+          echo ""
+          echo "=== Hillshades ==="
+          ls -lh ${{ env.HILLSHADE_PATH }}/
+
+      - name: Upload maps as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: map-tiles
+          path: maps-output/
+          retention-days: 7
+
+  # ============================================================
+  # JOB 2: Patch and build the Trekarta APK
+  # ============================================================
+  build-apk:
+    name: Build Patched Trekarta APK
+    runs-on: ubuntu-latest
+    needs: generate-maps
+
+    steps:
+      - name: Checkout trekarta source
+        uses: actions/checkout@v4
+        with:
+          repository: andreynovikov/trekarta
+          path: trekarta-src
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Patch server URL in Index.java
+        run: |
+          INDEX_FILE="trekarta-src/app/src/main/java/mobi/maptrek/maps/maptrek/Index.java"
+
+          echo "Patching server URL from trekarta.info to ${{ env.YOUR_SERVER_HOST }}..."
+
+          # Replace all occurrences of trekarta.info with our server
+          sed -i 's|\.authority("trekarta\.info")|.authority("${{ env.YOUR_SERVER_HOST }}")|g' "$INDEX_FILE"
+
+          # Verify the patch
+          echo "=== Patched URL references ==="
+          grep -n 'authority\|trekarta' "$INDEX_FILE"
+
+      - name: Make gradlew executable
+        run: chmod +x trekarta-src/gradlew
+
+      - name: Build release APK
+        working-directory: trekarta-src
+        run: |
+          ./gradlew assembleRelease \
+            -Pandroid.useAndroidX=true \
+            --no-daemon \
+            --stacktrace
+
+      - name: Rename APK with version
+        run: |
+          APK=$(find trekarta-src -name "*.apk" | head -1)
+          echo "Found APK: $APK"
+          DATE=$(date +%Y.%m.%d)
+          NEW_NAME="trekarta-custom-${DATE}.apk"
+          cp "$APK" "$NEW_NAME"
+          echo "APK_PATH=$NEW_NAME" >> $GITHUB_ENV
+          echo "RELEASE_TAG=custom-${DATE}" >> $GITHUB_ENV
+
+      - name: Upload APK as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trekarta-apk
+          path: ${{ env.APK_PATH }}
+          retention-days: 7
+
+  # ============================================================
+  # JOB 3: Commit maps to repo and create GitHub Release
+  # ============================================================
+  publish:
+    name: Publish Maps + Release
+    runs-on: ubuntu-latest
+    needs: [generate-maps, build-apk]
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download map tiles artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: map-tiles
+          path: downloaded-maps/
+
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: trekarta-apk
+          path: downloaded-apk/
+
+      - name: Copy maps into repo structure
+        run: |
+          # Create the nginx-ready directory structure in the repo
+          mkdir -p nginx-maps/maps
+          mkdir -p nginx-maps/hillshades
+
+          # Copy maps
+          cp -r downloaded-maps/maps/* nginx-maps/maps/
+          cp -r downloaded-maps/hillshades/* nginx-maps/hillshades/
+
+          echo "=== nginx-maps structure ==="
+          find nginx-maps -type f | sort | while read f; do
+            echo "  $(du -h $f | cut -f1)  $f"
+          done
+
+      - name: Write nginx config into repo
+        run: |
+          cat > nginx-maps/nginx.conf << 'NGINXEOF'
+          # Trekarta Map Server - Nginx Configuration
+          # Deploy: sudo cp nginx.conf /etc/nginx/sites-available/trekarta-maps
+          #         sudo ln -s /etc/nginx/sites-available/trekarta-maps /etc/nginx/sites-enabled/
+          #         sudo nginx -t && sudo systemctl reload nginx
+
+          server {
+              listen 80;
+              listen [::]:80;
+              server_name YOUR_SERVER_HOSTNAME;   # <-- change this
+
+              # Redirect HTTP to HTTPS (remove if no SSL)
+              # return 301 https://$host$request_uri;
+
+              root /var/www/trekarta-maps;
+
+              location /maps/ {
+                  alias /var/www/trekarta-maps/maps/;
+                  add_header Cache-Control "public, max-age=86400";
+                  add_header Access-Control-Allow-Origin "*";
+                  try_files $uri =404;
+              }
+
+              location /hillshades/ {
+                  alias /var/www/trekarta-maps/hillshades/;
+                  add_header Cache-Control "public, max-age=86400";
+                  add_header Access-Control-Allow-Origin "*";
+                  try_files $uri =404;
+              }
+
+              # Health check
+              location /health {
+                  return 200 "ok\n";
+                  add_header Content-Type text/plain;
+              }
+          }
+          NGINXEOF
+
+      - name: Write deploy script into repo
+        run: |
+          cat > nginx-maps/deploy.sh << 'DEPLOYEOF'
+          #!/bin/bash
+          # Run this on your server to deploy the map files
+          set -e
+
+          MAPS_DIR="/var/www/trekarta-maps"
+
+          echo "Creating map directory..."
+          sudo mkdir -p "$MAPS_DIR/maps"
+          sudo mkdir -p "$MAPS_DIR/hillshades"
+
+          echo "Syncing maps..."
+          sudo rsync -av --delete maps/ "$MAPS_DIR/maps/"
+          sudo rsync -av --delete hillshades/ "$MAPS_DIR/hillshades/"
+
+          echo "Setting permissions..."
+          sudo chown -R www-data:www-data "$MAPS_DIR"
+          sudo chmod -R 755 "$MAPS_DIR"
+
+          echo "Reloading nginx..."
+          sudo nginx -t && sudo systemctl reload nginx
+
+          echo "Done! Map server is live."
+          DEPLOYEOF
+          chmod +x nginx-maps/deploy.sh
+
+      - name: Commit maps to repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add nginx-maps/
+
+          # Only commit if there are changes
+          if git diff --staged --quiet; then
+            echo "No changes to map files, skipping commit"
+          else
+            DATE=$(date +%Y-%m-%d)
+            git commit -m "chore: update map tiles [${DATE}]
+
+          - Regenerated .mtiles from latest OSM data
+          - Updated binary index
+          - Auto-generated by GitHub Actions"
+
+            git push
+            echo "Maps committed and pushed"
+          fi
+
+      - name: Set release info
+        id: release-info
+        run: |
+          DATE=$(date +%Y.%m.%d)
+          APK_FILE=$(find downloaded-apk/ -name "*.apk" | head -1)
+          echo "date=$DATE" >> $GITHUB_OUTPUT
+          echo "apk_file=$APK_FILE" >> $GITHUB_OUTPUT
+          echo "tag=release-$DATE" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release-info.outputs.tag }}
+          name: "Trekarta Custom Build — ${{ steps.release-info.outputs.date }}"
+          body: |
+            ## Trekarta — Custom Build with Self-Hosted Map Server
+
+            ### What's in this release
+            - **Patched APK** — points to your own map server instead of the defunct `trekarta.info`
+            - **Map tiles** — committed to `nginx-maps/` folder in this repo
+            - **Region(s):** `${{ github.event.inputs.regions || 'asia/nepal' }}`
+            - **OSM data date:** ${{ steps.release-info.outputs.date }}
+
+            ### Installation
+            1. Download the APK below and install on your Android device
+            2. Deploy map files to your server using `nginx-maps/deploy.sh`
+            3. Make sure your server hostname matches what was set in `YOUR_SERVER_HOST`
+
+            ### Server Setup
+            ```bash
+            # On your server
+            git clone <this-repo>
+            cd nginx-maps
+            ./deploy.sh
+            sudo cp nginx.conf /etc/nginx/sites-available/trekarta-maps
+            sudo ln -s /etc/nginx/sites-available/trekarta-maps /etc/nginx/sites-enabled/
+            sudo nginx -t && sudo systemctl reload nginx
+            ```
+
+            ### Map Grid Reference
+            Nepal covers tiles: `x=92-95, y=52-54` at zoom level 7
+          files: ${{ steps.release-info.outputs.apk_file }}
+          token: ${{ secrets.GITHUB_TOKEN }}
