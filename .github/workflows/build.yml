@@ -112,7 +112,7 @@ jobs:
           sudo apt-get install -y \
             wget git sqlite3 osmium-tool osmctools python3-pip \
             --no-install-recommends
-          pip3 install mercantile osmium shapely psutil setproctitle tqdm psycopg2-binary webcolors
+          pip3 install mercantile osmium shapely psutil setproctitle tqdm psycopg2-binary webcolors pyproj
 
       - name: Clone mapcreator
         run: git clone --depth=1 https://github.com/andreynovikov/mapcreator.git /tmp/mapcreator
