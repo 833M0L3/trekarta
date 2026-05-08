@@ -8,6 +8,10 @@ on:
         description: 'Geofabrik regions (comma-separated)'
         required: false
         default: 'asia/nepal'
+      maxzoom:
+        description: 'Tile max zoom (mapcreator-like higher detail, 7-12 recommended)'
+        required: false
+        default: '10'
 
 permissions:
   contents: write
@@ -145,8 +149,9 @@ jobs:
 
       - name: Generate MBTiles
         run: |
+          MAX_ZOOM="${{ github.event.inputs.maxzoom || '10' }}"
           # Use Python for a syntax-safe JSON modification
-          python3 -c 'import json; p="/tmp/tilemaker/resources/config-openmaptiles.json"; d=json.load(open(p)); d["settings"]["maxzoom"]=7; json.dump(d, open(p, "w"))'
+          python3 -c "import json; p='/tmp/tilemaker/resources/config-openmaptiles.json'; d=json.load(open(p)); d['settings']['maxzoom']=int('${MAX_ZOOM}'); json.dump(d, open(p, 'w'))"
           
           tilemaker \
             --input /tmp/gis-data/source.osm.pbf \
@@ -158,40 +163,67 @@ jobs:
 
       - name: Extract Trekarta map tiles
         run: |
+          MAX_ZOOM="${{ github.event.inputs.maxzoom || '10' }}"
           python3 << 'EOF'
-          import sqlite3, os, struct, time
+          import sqlite3, os, struct
           mbtiles_path = '/tmp/maps-output/nepal.mbtiles'
           map_target = '/tmp/maps-output/maps'
           os.makedirs(map_target, exist_ok=True)
+          max_zoom = int(os.environ.get('MAX_ZOOM', '10'))
+          if max_zoom < 7:
+            max_zoom = 7
           
           src = sqlite3.connect(mbtiles_path)
-          tiles = src.execute("SELECT tile_column, tile_row, tile_data FROM tiles WHERE zoom_level=7").fetchall()
+          cursor = src.execute(
+            "SELECT zoom_level, tile_column, tile_row, tile_data "
+            "FROM tiles WHERE zoom_level BETWEEN 7 AND ?",
+            (max_zoom,)
+          )
           
-          now = int(time.time())
           # Java reads 'short date' (2 bytes) + 'int size' (4 bytes) per entry.
-          # Compact date: days since 2000-01-01 — fits in a short (max 32767).
-          date_short = (now - 946684800) // 86400
+          # Use source file age like mapcreator does (days since epoch).
+          source_pbf = '/tmp/gis-data/source.osm.pbf'
+          date_short = int(os.path.getmtime(source_pbf) // 86400)
           tile_map = {}
+          dbs = {}
+
+          def get_area_db(area_x, area_y):
+            key = (area_x, area_y)
+            if key in dbs:
+              return dbs[key]
+            tile_dir = f"{map_target}/{area_x}"
+            os.makedirs(tile_dir, exist_ok=True)
+            tile_path = f"{tile_dir}/{area_x}-{area_y}.mtiles"
+            dst = sqlite3.connect(tile_path)
+            dst.execute("CREATE TABLE IF NOT EXISTS tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB)")
+            dst.execute("CREATE TABLE IF NOT EXISTS metadata (name TEXT, value TEXT)")
+            dst.execute("CREATE UNIQUE INDEX IF NOT EXISTS coord ON tiles (zoom_level, tile_column, tile_row)")
+            dst.execute("CREATE UNIQUE INDEX IF NOT EXISTS property ON metadata (name)")
+            dst.execute("INSERT OR REPLACE INTO metadata VALUES ('name', ?)", (f"{area_x}-{area_y}",))
+            dst.execute("INSERT OR REPLACE INTO metadata VALUES ('type', 'baselayer')")
+            dst.execute("INSERT OR REPLACE INTO metadata VALUES ('version', '3')")
+            dst.execute("INSERT OR REPLACE INTO metadata VALUES ('timestamp', ?)", (str(date_short),))
+            dst.execute("INSERT OR REPLACE INTO metadata VALUES ('format', 'maptrek')")
+            dbs[key] = (dst, tile_path)
+            return dbs[key]
           
-          for (x, tms_y, data) in tiles:
-              y = (2**7 - 1) - tms_y
-              tile_dir = f"{map_target}/{x}"
-              os.makedirs(tile_dir, exist_ok=True)
-              
-              tile_path = f"{tile_dir}/{x}-{y}.mtiles"
-              dst = sqlite3.connect(tile_path)
-              dst.execute("CREATE TABLE IF NOT EXISTS tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB)")
-              dst.execute("CREATE TABLE IF NOT EXISTS metadata (name TEXT, value TEXT)")
-              dst.execute("INSERT OR REPLACE INTO metadata VALUES ('timestamp', ?)", (str(date_short),))
-              dst.execute("INSERT INTO tiles VALUES (7, ?, ?, ?)", (x, tms_y, data))
-              dst.commit()
-              dst.close()
-              
-              tile_map[(x, y)] = os.path.getsize(tile_path)
+          for (z, x, tms_y, data) in cursor:
+            y_xyz = (2**z - 1) - tms_y
+            # Group all subtiles into Trekarta's zoom-7 area bucket.
+            shift = z - 7
+            area_x = x >> shift
+            area_y = y_xyz >> shift
+            dst, tile_path = get_area_db(area_x, area_y)
+            dst.execute("REPLACE INTO tiles VALUES (?, ?, ?, ?)", (z, x, tms_y, data))
+
+          for (area_x, area_y), (dst, tile_path) in dbs.items():
+            dst.commit()
+            dst.close()
+            tile_map[(area_x, area_y)] = os.path.getsize(tile_path)
           
           src.close()
           
-            # Index format: short date (2 bytes) + unsigned int size (4 bytes) = 6 bytes per entry
+          # Index format: short date (2 bytes) + unsigned int size (4 bytes) = 6 bytes per entry
           index_path = f"{map_target}/index"
           with open(index_path, 'wb') as f:
               for x in range(128):
@@ -225,6 +257,7 @@ jobs:
           
           TILE_COUNT=$(find /tmp/gh-pages/maps -name "*.mtiles" | wc -l)
           BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
+          MAX_ZOOM="${{ github.event.inputs.maxzoom || '10' }}"
           
           cat > /tmp/gh-pages/index.html << HTML
           <!DOCTYPE html>
@@ -232,7 +265,8 @@ jobs:
           <head><title>Trekarta Maps</title></head>
           <body>
             <h2>Trekarta Map Server</h2>
-            <p>Tiles (Zoom 7): ${TILE_COUNT}</p>
+            <p>Area files: ${TILE_COUNT}</p>
+            <p>Zoom range: 7..${MAX_ZOOM}</p>
             <p>Last Build: ${BUILD_DATE}</p>
           </body>
           </html>
