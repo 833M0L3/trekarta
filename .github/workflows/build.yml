@@ -17,7 +17,7 @@ permissions:
 jobs:
 
   # ============================================================
-  # Build Trekarta APK
+  # Build APK
   # ============================================================
   build-apk:
     name: Build APK
@@ -79,12 +79,12 @@ jobs:
             Commit: ${{ github.sha }}
             Branch: ${{ github.ref_name }}
 
-            Custom Trekarta build using GitHub Pages map hosting.
+            Custom Trekarta build with GitHub Pages map hosting.
           files: app/build/outputs/apk/debug/${{ steps.version.outputs.apk_name }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
   # ============================================================
-  # Generate Nepal Maps + Publish to GitHub Pages
+  # Generate Maps + Publish
   # ============================================================
   publish-maps:
     name: Generate + Publish Maps
@@ -97,26 +97,70 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ========================================================
+      # Install dependencies
+      # ========================================================
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
 
           sudo apt-get install -y \
-            tilemaker \
-            sqlite3 \
+            build-essential \
+            cmake \
+            libboost-dev \
+            libboost-program-options-dev \
+            libboost-filesystem-dev \
+            libboost-system-dev \
+            libboost-iostreams-dev \
+            liblua5.1-0-dev \
+            lua5.1 \
+            libprotobuf-dev \
+            protobuf-compiler \
+            zlib1g-dev \
+            rapidjson-dev \
             wget \
+            git \
+            sqlite3 \
             osmium-tool \
             python3-pip \
             --no-install-recommends
 
           pip3 install mercantile
 
+      # ========================================================
+      # Build latest tilemaker from GitHub
+      # ========================================================
+      - name: Clone tilemaker
+        run: |
+          git clone --depth=1 https://github.com/systemed/tilemaker.git /tmp/tilemaker
+
+      - name: Build tilemaker
+        run: |
+          cd /tmp/tilemaker
+
+          mkdir build
+          cd build
+
+          cmake ..
+
+          make -j$(nproc)
+
+          sudo make install
+
+          tilemaker --help | head
+
+      # ========================================================
+      # Create directories
+      # ========================================================
       - name: Create directories
         run: |
           mkdir -p /tmp/gis-data
           mkdir -p /tmp/maps-output/maps
           mkdir -p /tmp/maps-output/hillshades
 
+      # ========================================================
+      # Download OSM
+      # ========================================================
       - name: Download OSM data
         run: |
           REGIONS="${{ github.event.inputs.regions || 'asia/nepal' }}"
@@ -124,7 +168,9 @@ jobs:
           IFS=',' read -ra REGION_LIST <<< "$REGIONS"
 
           for REGION in "${REGION_LIST[@]}"; do
+
             REGION=$(echo "$REGION" | xargs)
+
             FILENAME=$(basename "$REGION")
 
             echo "Downloading $REGION"
@@ -132,32 +178,44 @@ jobs:
             wget -q --show-progress \
               "https://download.geofabrik.de/${REGION}-latest.osm.pbf" \
               -O "/tmp/gis-data/${FILENAME}-latest.osm.pbf"
+
           done
 
           PBFS=(/tmp/gis-data/*-latest.osm.pbf)
 
           if [ ${#PBFS[@]} -gt 1 ]; then
+
             osmium merge "${PBFS[@]}" \
               -o /tmp/gis-data/source.osm.pbf \
               --overwrite
+
           else
-            cp "${PBFS[0]}" /tmp/gis-data/source.osm.pbf
+
+            cp "${PBFS[0]}" /tmp/gis-data/source.osm.pbf"
+
           fi
 
           ls -lh /tmp/gis-data/source.osm.pbf
 
+      # ========================================================
+      # Generate MBTiles
+      # ========================================================
       - name: Generate MBTiles
         run: |
           tilemaker \
             --input /tmp/gis-data/source.osm.pbf \
             --output /tmp/maps-output/nepal.mbtiles \
-            --config /usr/share/tilemaker/config.json \
-            --process /usr/share/tilemaker/process.lua \
+            --config /tmp/tilemaker/resources/config-openmaptiles.json \
+            --process /tmp/tilemaker/resources/process-openmaptiles.lua \
             --store /tmp/tilemaker-store \
+            --max-zoom=7 \
             --verbose
 
           ls -lh /tmp/maps-output/nepal.mbtiles
 
+      # ========================================================
+      # Convert to Trekarta .mtiles
+      # ========================================================
       - name: Extract Trekarta map tiles
         run: |
           python3 << 'EOF'
@@ -179,9 +237,10 @@ jobs:
               WHERE zoom_level=7
           """).fetchall()
 
-          print(f"Found {len(tiles)} zoom-7 tiles")
+          print(f"Found {len(tiles)} tiles")
 
           now = int(time.time())
+
           tile_map = {}
 
           for (x, tms_y, data) in tiles:
@@ -247,8 +306,12 @@ jobs:
               f.write(struct.pack('>hI', 0, 0))
 
           print("Index generated")
+
           EOF
 
+      # ========================================================
+      # Blank hillshade index
+      # ========================================================
       - name: Create blank hillshade index
         run: |
           python3 << 'EOF'
@@ -264,7 +327,10 @@ jobs:
           print("Hillshade index generated")
           EOF
 
-      - name: Prepare GitHub Pages files
+      # ========================================================
+      # Prepare GitHub Pages
+      # ========================================================
+      - name: Prepare GitHub Pages
         run: |
           mkdir -p /tmp/gh-pages/maps
           mkdir -p /tmp/gh-pages/hillshades
@@ -274,95 +340,29 @@ jobs:
 
           TILE_COUNT=$(find /tmp/gh-pages/maps -name "*.mtiles" | wc -l)
           BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
-          COMMIT_SHORT=$(echo ${{ github.sha }} | cut -c1-7)
 
           cat > /tmp/gh-pages/index.html << HTML
           <!DOCTYPE html>
           <html>
           <head>
             <title>Trekarta Nepal Maps</title>
-
-            <style>
-              body {
-                font-family: sans-serif;
-                max-width: 700px;
-                margin: 40px auto;
-                padding: 0 20px;
-                color: #333;
-              }
-
-              code {
-                background: #f4f4f4;
-                padding: 2px 6px;
-                border-radius: 3px;
-              }
-
-              table {
-                border-collapse: collapse;
-                width: 100%;
-                margin-top: 20px;
-              }
-
-              td {
-                border-bottom: 1px solid #eee;
-                padding: 8px 12px;
-              }
-
-              td:first-child {
-                font-weight: bold;
-                width: 180px;
-              }
-            </style>
           </head>
-
           <body>
             <h2>Trekarta Nepal Map Server</h2>
 
-            <table>
-              <tr>
-                <td>Tiles</td>
-                <td>${TILE_COUNT}</td>
-              </tr>
-
-              <tr>
-                <td>Region</td>
-                <td>Nepal</td>
-              </tr>
-
-              <tr>
-                <td>Updated</td>
-                <td>${BUILD_DATE}</td>
-              </tr>
-
-              <tr>
-                <td>Commit</td>
-                <td>${COMMIT_SHORT}</td>
-              </tr>
-            </table>
-
-            <h3>Endpoints</h3>
+            <p>Tiles: ${TILE_COUNT}</p>
+            <p>Updated: ${BUILD_DATE}</p>
 
             <p>
-              <code>
-              https://833m0l3.github.io/trekarta/maps/{x}/{x}-{y}.mtiles
-              </code>
-            </p>
-
-            <p>
-              <code>
-              https://833m0l3.github.io/trekarta/maps/index
-              </code>
-            </p>
-
-            <p>
-              <code>
-              https://833m0l3.github.io/trekarta/hillshades/index
-              </code>
+              https://833m0l3.github.io/trekarta/maps/
             </p>
           </body>
           </html>
           HTML
 
+      # ========================================================
+      # Deploy Pages
+      # ========================================================
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
         with:
