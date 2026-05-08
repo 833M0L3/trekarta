@@ -100,6 +100,8 @@ import static mobi.maptrek.maps.maptrek.MapTrekDatabaseHelper.WHERE_MAPS_XY;
 
 public class Index {
     private static final Logger logger = LoggerFactory.getLogger(Index.class);
+    private static final String MAP_SERVER_HOST = "833m0l3.github.io";
+    private static final String MAP_SERVER_ROOT = "trekarta";
 
     public static final String WORLDMAP_FILENAME = "world.mtiles";
     public static final String BASEMAP_FILENAME = "basemap.mtiles";
@@ -778,7 +780,8 @@ public class Index {
     public void downloadBaseMap() {
         Uri uri = new Uri.Builder()
                 .scheme("https")
-                .authority("trekarta.info")
+            .authority(MAP_SERVER_HOST)
+            .appendPath(MAP_SERVER_ROOT)
                 .appendPath("maps")
                 .appendPath(BASEMAP_FILENAME)
                 .build();
@@ -830,7 +833,8 @@ public class Index {
         String fileName = String.format(Locale.ENGLISH, "%d-%d.%s", x, y, ext);
         Uri uri = new Uri.Builder()
                 .scheme("https")
-                .authority("trekarta.info")
+            .authority(MAP_SERVER_HOST)
+            .appendPath(MAP_SERVER_ROOT)
                 .appendPath(hillshade ? "hillshades" : "maps")
                 .appendPath(String.valueOf(x))
                 .appendPath(fileName)
@@ -984,7 +988,8 @@ public class Index {
     public static Uri getIndexUri() {
         return new Uri.Builder()
                 .scheme("https")
-                .authority("trekarta.info")
+                .authority(MAP_SERVER_HOST)
+                .appendPath(MAP_SERVER_ROOT)
                 .appendPath("maps")
                 .appendPath("index")
                 .build();
@@ -993,7 +998,8 @@ public class Index {
     public static Uri getHillshadeIndexUri() {
         return new Uri.Builder()
                 .scheme("https")
-                .authority("trekarta.info")
+                .authority(MAP_SERVER_HOST)
+                .appendPath(MAP_SERVER_ROOT)
                 .appendPath("hillshades")
                 .appendPath("index")
                 .build();
