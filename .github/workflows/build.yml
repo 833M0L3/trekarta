@@ -203,8 +203,15 @@ jobs:
       # ========================================================
       - name: Generate MBTiles
         run: |
-          # 1. Modify the config file to limit zoom to 7
-          sed -i 's/"maxzoom": [0-9]*/"maxzoom": 7/' /tmp/tilemaker/resources/config-openmaptiles.json
+          python3 -c '
+            import json
+            path = "/tmp/tilemaker/resources/config-openmaptiles.json"
+            with open(path, "r") as f:
+                data = json.load(f)
+            data["settings"]["maxzoom"] = 7
+            with open(path, "w") as f:
+                json.dump(data, f, indent=4)
+            '
           tilemaker \
             --input /tmp/gis-data/source.osm.pbf \
             --output /tmp/maps-output/nepal.mbtiles \
