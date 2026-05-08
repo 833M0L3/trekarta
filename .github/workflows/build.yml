@@ -220,7 +220,8 @@ jobs:
             area_x = x >> shift
             area_y = y_xyz >> shift
             dst, tile_path = get_area_db(area_x, area_y)
-            dst.execute("REPLACE INTO tiles VALUES (?, ?, ?, ?)", (z, x, tms_y, data))
+            # Trekarta map tiles use XYZ row indexing.
+            dst.execute("REPLACE INTO tiles VALUES (?, ?, ?, ?)", (z, x, y_xyz, data))
 
           for (area_x, area_y), (dst, tile_path) in dbs.items():
             dst.commit()
