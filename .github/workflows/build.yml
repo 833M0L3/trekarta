@@ -145,6 +145,30 @@ jobs:
               'try:\n    from spooky import hash64\nexcept Exception:\n    import hashlib\n\n    def hash64(value):\n        if isinstance(value, str):\n            value = value.encode(\'utf-8\')\n        elif not isinstance(value, (bytes, bytearray)):\n            value = str(value).encode(\'utf-8\')\n        return int.from_bytes(hashlib.blake2b(value, digest_size=8).digest(), \"big\", signed=False)'
             )
 
+            # osmium 3.x removed the .names attribute from OSM objects;
+            # names are already present in .tags - replace the o.names block
+            # with an equivalent tags-based extraction.
+            old_names_block = (
+              '        if o.names:\n'
+              '            for k, v in o.names.items():\n'
+              "                o.tags['name:{}'.format(k) if k else 'name'] = v\n"
+            )
+            new_names_block = (
+              '        _onames = {}\n'
+              '        for _ok, _ov in o.tags:\n'
+              "            if _ok == 'name':\n"
+              "                _onames[''] = _ov\n"
+              "            elif _ok.startswith('name:') and len(_ok) > 5:\n"
+              "                _onames[_ok[5:]] = _ov\n"
+              '        if _onames:\n'
+              '            for k, v in _onames.items():\n'
+              "                try:\n"
+              "                    o.tags['name:{}'.format(k) if k else 'name'] = v\n"
+              "                except (TypeError, AttributeError):\n"
+              "                    pass\n"
+            )
+            patched = patched.replace(old_names_block, new_names_block)
+
             if patched != text:
               path.write_text(patched, encoding='utf-8')
           EOF
