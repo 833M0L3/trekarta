@@ -154,7 +154,6 @@ jobs:
             --config /usr/share/tilemaker/config.json \
             --process /usr/share/tilemaker/process.lua \
             --store /tmp/tilemaker-store \
-            --max-zoom=7 \
             --verbose
 
           ls -lh /tmp/maps-output/nepal.mbtiles
