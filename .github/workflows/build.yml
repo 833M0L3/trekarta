@@ -112,7 +112,7 @@ jobs:
           sudo apt-get install -y \
             wget git sqlite3 osmium-tool osmctools python3-pip \
             --no-install-recommends
-          pip3 install mercantile osmium shapely psutil setproctitle tqdm psycopg2-binary webcolors pyproj
+          pip3 install mercantile osmium shapely psutil setproctitle tqdm psycopg2-binary webcolors pyproj protobuf
 
       - name: Clone mapcreator
         run: git clone --depth=1 https://github.com/andreynovikov/mapcreator.git /tmp/mapcreator
@@ -137,6 +137,12 @@ jobs:
             patched = patched.replace(
               'from shapely.ops import cascaded_union',
               'from shapely.ops import unary_union as cascaded_union'
+            )
+
+            # util.database imports spooky hash, which may be unavailable on CI.
+            patched = patched.replace(
+              'from spooky import hash64',
+              'try:\n    from spooky import hash64\nexcept Exception:\n    import hashlib\n\n    def hash64(value):\n        if isinstance(value, str):\n            value = value.encode(\'utf-8\')\n        elif not isinstance(value, (bytes, bytearray)):\n            value = str(value).encode(\'utf-8\')\n        return int.from_bytes(hashlib.blake2b(value, digest_size=8).digest(), \"big\", signed=False)'
             )
 
             if patched != text:
