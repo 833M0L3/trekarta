@@ -151,7 +151,7 @@ jobs:
 
       - name: Patch mapcreator configuration for CI paths
         run: |
-          sed -i "s|^SOURCE_PBF = .*|SOURCE_PBF = '/tmp/gis-data/source.osm.pbf'|" /tmp/mapcreator/configuration.py
+          sed -i "s|^SOURCE_PBF = .*|SOURCE_PBF = '/tmp/gis-data/source.o5m'|" /tmp/mapcreator/configuration.py
           sed -i "s|^MAP_TARGET_PATH = .*|MAP_TARGET_PATH = '/tmp/maps-output/maps'|" /tmp/mapcreator/configuration.py
           sed -i "s|^LOGGING_PATH = .*|LOGGING_PATH = '/tmp'|" /tmp/mapcreator/configuration.py
           sed -i "s|^DATA_PATH = .*|DATA_PATH = '/tmp/gis-data'|" /tmp/mapcreator/configuration.py
@@ -208,6 +208,10 @@ jobs:
           else
             cp "${PBFS[0]}" "/tmp/gis-data/source.osm.pbf"
           fi
+
+      - name: Convert OSM data to o5m format
+        run: |
+          osmconvert /tmp/gis-data/source.osm.pbf -o=/tmp/gis-data/source.o5m
 
       - name: Generate Trekarta native map tiles
         run: |
