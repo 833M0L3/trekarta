@@ -113,6 +113,7 @@ jobs:
             libboost-system-dev \
             libboost-iostreams-dev \
             liblua5.1-0-dev \
+            libshp-dev \
             lua5.1 \
             libprotobuf-dev \
             protobuf-compiler \
