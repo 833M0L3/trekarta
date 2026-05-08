@@ -78,7 +78,7 @@ jobs:
             **Commit:** ${{ github.sha }}
             **Branch:** ${{ github.ref_name }}
 
-            > Debug build — points to GitHub Pages map server
+            > Debug build — points to GitHub Pages map server at https://833m0l3.github.io/trekarta/
           files: app/build/outputs/apk/debug/${{ steps.version.outputs.apk_name }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -101,26 +101,19 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y \
-            sqlite3 python3-pip wget \
-            libboost-filesystem-dev \
-            libboost-iostreams-dev \
-            libboost-program-options-dev \
-            libboost-system-dev \
-            liblua5.1-0-dev \
-            libshp-dev \
-            libsqlite3-dev \
+            tilemaker \
+            sqlite3 \
+            python3-pip \
+            wget \
+            osmium-tool \
             --no-install-recommends
-
-          # Install tilemaker binary
-          wget -q https://github.com/systemed/tilemaker/releases/download/v2.4.0/tilemaker-ubuntu-22.04.gz
-          gunzip tilemaker-ubuntu-22.04.gz
-          chmod +x tilemaker-ubuntu-22.04
-          sudo mv tilemaker-ubuntu-22.04 /usr/local/bin/tilemaker
-
           pip3 install mercantile
+          tilemaker --version
 
-      - name: Clone tilemaker resources (lua scripts + config)
+      - name: Get tilemaker config files
         run: |
+          TILEMAKER_VERSION=$(tilemaker --version 2>&1 | grep -o '[0-9]*\.[0-9]*\.[0-9]*' | head -1)
+          echo "Tilemaker version: $TILEMAKER_VERSION"
           git clone --depth=1 https://github.com/systemed/tilemaker.git /tmp/tilemaker-src
 
       - name: Create directories
@@ -142,10 +135,8 @@ jobs:
               -O "/tmp/gis-data/${FILENAME}-latest.osm.pbf"
           done
 
-          # Merge if multiple regions
           PBFS=(/tmp/gis-data/*-latest.osm.pbf)
           if [ ${#PBFS[@]} -gt 1 ]; then
-            sudo apt-get install -y osmium-tool -qq
             osmium merge "${PBFS[@]}" -o /tmp/gis-data/source.osm.pbf --overwrite
           else
             cp "${PBFS[0]}" /tmp/gis-data/source.osm.pbf
@@ -161,13 +152,12 @@ jobs:
             --process /tmp/tilemaker-src/resources/process-openmaptiles.lua \
             --store /tmp/tilemaker-store \
             --verbose
-
           ls -lh /tmp/maps-output/nepal.mbtiles
 
-      - name: Extract tiles from mbtiles into mtiles per-tile files
+      - name: Extract tiles into per-tile mtiles files + write index
         run: |
           python3 << 'EOF'
-          import sqlite3, os, struct, mercantile
+          import sqlite3, os, struct, time
 
           mbtiles_path = '/tmp/maps-output/nepal.mbtiles'
           map_target = '/tmp/maps-output/maps'
@@ -175,22 +165,21 @@ jobs:
 
           src = sqlite3.connect(mbtiles_path)
 
-          # Get all zoom-7 tiles
           tiles = src.execute(
               "SELECT tile_column, tile_row, tile_data FROM tiles WHERE zoom_level=7"
           ).fetchall()
-
           print(f"Found {len(tiles)} zoom-7 tiles")
 
-          written = []
+          now = int(time.time())
+          tile_map = {}
+
           for (x, tms_y, data) in tiles:
-              # mbtiles uses TMS y (flipped), convert to XYZ
+              # mbtiles TMS y is flipped vs XYZ
               y = (2**7 - 1) - tms_y
               tile_dir = f"{map_target}/{x}"
               os.makedirs(tile_dir, exist_ok=True)
               tile_path = f"{tile_dir}/{x}-{y}.mtiles"
 
-              # Each .mtiles is a minimal sqlite with the tile data
               dst = sqlite3.connect(tile_path)
               dst.execute("""
                   CREATE TABLE IF NOT EXISTS tiles (
@@ -206,35 +195,30 @@ jobs:
                       value TEXT
                   )
               """)
-              import time
-              dst.execute("INSERT OR REPLACE INTO metadata VALUES ('timestamp', ?)",
-                          (str(int(time.time())),))
+              dst.execute("INSERT OR REPLACE INTO metadata VALUES ('timestamp', ?)", (str(now),))
               dst.execute("INSERT INTO tiles VALUES (7, ?, ?, ?)", (x, tms_y, data))
               dst.commit()
               dst.close()
+
               size = os.path.getsize(tile_path)
-              print(f"  Written {x}-{y}.mtiles ({size/1024:.1f} KB)")
-              written.append((x, y, size))
+              tile_map[(x, y)] = size
+              print(f"  {x}-{y}.mtiles  ({size/1024:.1f} KB)")
 
           src.close()
-          print(f"\nTotal: {len(written)} tiles written")
+          print(f"\nTotal: {len(tile_map)} tiles written")
 
-          # Write binary index (128x128 grid * 6 bytes + 6 bytes basemap)
+          # Binary index: 128x128 cells * 6 bytes each + 6 bytes for basemap
           index_path = f"{map_target}/index"
-          tile_map = {(x, y): size for x, y, size in written}
-          import time as t
-          now = int(t.time())
-
           with open(index_path, 'wb') as f:
               for x in range(128):
                   for y in range(128):
                       size = tile_map.get((x, y), 0)
                       date = now if size > 0 else 0
                       f.write(struct.pack('>hI', date, size))
-              # basemap entry (none)
+              # basemap entry (empty)
               f.write(struct.pack('>hI', 0, 0))
 
-          print(f"Index written: {len(written)} non-empty tiles")
+          print(f"Index written: {len(tile_map)} non-empty tiles, {os.path.getsize(index_path)} bytes")
           EOF
 
       - name: Create blank hillshade index
@@ -254,18 +238,21 @@ jobs:
           find /tmp/maps-output/maps -type f | sort | while read f; do
             echo "  $(du -h $f | cut -f1)  $f"
           done
+          echo ""
+          echo "Index size: $(du -h /tmp/maps-output/maps/index | cut -f1)"
+          echo "Total tiles: $(find /tmp/maps-output/maps -name '*.mtiles' | wc -l)"
 
       - name: Prepare GitHub Pages content
         run: |
           mkdir -p /tmp/gh-pages/maps
           mkdir -p /tmp/gh-pages/hillshades
 
-          cp -r /tmp/maps-output/maps/* /tmp/gh-pages/maps/ 2>/dev/null || true
-          cp -r /tmp/maps-output/hillshades/* /tmp/gh-pages/hillshades/ 2>/dev/null || true
+          cp -r /tmp/maps-output/maps/* /tmp/gh-pages/maps/
+          cp -r /tmp/maps-output/hillshades/* /tmp/gh-pages/hillshades/
 
-          # Count tiles for status page
           TILE_COUNT=$(find /tmp/gh-pages/maps -name "*.mtiles" | wc -l)
           BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
+          COMMIT_SHORT=$(echo ${{ github.sha }} | cut -c1-7)
 
           cat > /tmp/gh-pages/index.html << HTML
           <!DOCTYPE html>
@@ -273,21 +260,26 @@ jobs:
           <head>
             <title>Trekarta Map Server — Nepal</title>
             <style>
-              body { font-family: sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; }
-              code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; }
+              body { font-family: sans-serif; max-width: 640px; margin: 40px auto; padding: 0 20px; color: #333; }
+              code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }
+              table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+              td { padding: 6px 12px; border-bottom: 1px solid #eee; }
+              td:first-child { font-weight: bold; width: 140px; }
             </style>
           </head>
           <body>
-            <h2>Trekarta Map Server</h2>
+            <h2>🗺 Trekarta Map Server</h2>
             <p>Serving Nepal map tiles for the custom Trekarta build.</p>
             <table>
-              <tr><td><b>Tiles available:</b></td><td>${TILE_COUNT}</td></tr>
-              <tr><td><b>Region:</b></td><td>Nepal (asia/nepal)</td></tr>
-              <tr><td><b>Last updated:</b></td><td>${BUILD_DATE}</td></tr>
+              <tr><td>Tiles available</td><td>${TILE_COUNT}</td></tr>
+              <tr><td>Region</td><td>Nepal (asia/nepal)</td></tr>
+              <tr><td>Last updated</td><td>${BUILD_DATE}</td></tr>
+              <tr><td>Commit</td><td>${COMMIT_SHORT}</td></tr>
             </table>
             <h3>Endpoints</h3>
             <p><code>https://833m0l3.github.io/trekarta/maps/{x}/{x}-{y}.mtiles</code></p>
             <p><code>https://833m0l3.github.io/trekarta/maps/index</code></p>
+            <p><code>https://833m0l3.github.io/trekarta/hillshades/index</code></p>
           </body>
           </html>
           HTML
