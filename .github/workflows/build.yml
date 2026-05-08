@@ -198,7 +198,11 @@ jobs:
                   for y in range(128):
                       size = tile_map.get((x, y), 0)
                       f.write(struct.pack('>hI', date_short if size > 0 else 0, size))
-              f.write(struct.pack('>hI', 0, 0))
+                  # Basemap entry: use the bundled basemap.mtiles size
+                  import os as _os
+                  basemap_path = 'app/src/main/assets/databases/basemap.mtiles'
+                  basemap_size = _os.path.getsize(basemap_path) if _os.path.exists(basemap_path) else 0
+                  f.write(struct.pack('>hI', date_short if basemap_size > 0 else 0, basemap_size))
           EOF
 
       - name: Create blank hillshade index
@@ -217,6 +221,8 @@ jobs:
           mkdir -p /tmp/gh-pages/hillshades
           cp -r /tmp/maps-output/maps/* /tmp/gh-pages/maps/
           cp -r /tmp/maps-output/hillshades/* /tmp/gh-pages/hillshades/
+                    # Copy bundled basemap so the download URL resolves
+                    cp app/src/main/assets/databases/basemap.mtiles /tmp/gh-pages/maps/basemap.mtiles
           
           TILE_COUNT=$(find /tmp/gh-pages/maps -name "*.mtiles" | wc -l)
           BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
