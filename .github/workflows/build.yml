@@ -182,7 +182,7 @@ jobs:
               dst = sqlite3.connect(tile_path)
               dst.execute("CREATE TABLE IF NOT EXISTS tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB)")
               dst.execute("CREATE TABLE IF NOT EXISTS metadata (name TEXT, value TEXT)")
-              dst.execute("INSERT OR REPLACE INTO metadata VALUES ('timestamp', ?)", (str(now),))
+              dst.execute("INSERT OR REPLACE INTO metadata VALUES ('timestamp', ?)", (str(date_short),))
               dst.execute("INSERT INTO tiles VALUES (7, ?, ?, ?)", (x, tms_y, data))
               dst.commit()
               dst.close()
@@ -191,18 +191,17 @@ jobs:
           
           src.close()
           
-          # Index format: short date (2 bytes) + unsigned int size (4 bytes) = 6 bytes per entry
+            # Index format: short date (2 bytes) + unsigned int size (4 bytes) = 6 bytes per entry
           index_path = f"{map_target}/index"
           with open(index_path, 'wb') as f:
               for x in range(128):
                   for y in range(128):
                       size = tile_map.get((x, y), 0)
                       f.write(struct.pack('>hI', date_short if size > 0 else 0, size))
-                  # Basemap entry: use the bundled basemap.mtiles size
-                  import os as _os
-                  basemap_path = 'app/src/main/assets/databases/basemap.mtiles'
-                  basemap_size = _os.path.getsize(basemap_path) if _os.path.exists(basemap_path) else 0
-                  f.write(struct.pack('>hI', date_short if basemap_size > 0 else 0, basemap_size))
+              # Basemap entry: append once after all map entries
+              basemap_path = 'app/src/main/assets/databases/basemap.mtiles'
+              basemap_size = os.path.getsize(basemap_path) if os.path.exists(basemap_path) else 0
+              f.write(struct.pack('>hI', date_short if basemap_size > 0 else 0, basemap_size))
           EOF
 
       - name: Create blank hillshade index
@@ -221,8 +220,8 @@ jobs:
           mkdir -p /tmp/gh-pages/hillshades
           cp -r /tmp/maps-output/maps/* /tmp/gh-pages/maps/
           cp -r /tmp/maps-output/hillshades/* /tmp/gh-pages/hillshades/
-                    # Copy bundled basemap so the download URL resolves
-                    cp app/src/main/assets/databases/basemap.mtiles /tmp/gh-pages/maps/basemap.mtiles
+          # Copy bundled basemap so the download URL resolves
+          cp app/src/main/assets/databases/basemap.mtiles /tmp/gh-pages/maps/basemap.mtiles
           
           TILE_COUNT=$(find /tmp/gh-pages/maps -name "*.mtiles" | wc -l)
           BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
