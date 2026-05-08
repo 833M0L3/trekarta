@@ -75,6 +75,7 @@ jobs:
             Build: ${{ steps.version.outputs.version_code }}
             Commit: ${{ github.sha }}
             Branch: ${{ github.ref_name }}
+            
             Custom Trekarta build with GitHub Pages map hosting.
           files: app/build/outputs/apk/debug/${{ steps.version.outputs.apk_name }}
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -144,7 +145,7 @@ jobs:
 
       - name: Generate MBTiles
         run: |
-          # Safe JSON update for maxzoom
+          # Use Python for a syntax-safe JSON modification
           python3 -c 'import json; p="/tmp/tilemaker/resources/config-openmaptiles.json"; d=json.load(open(p)); d["settings"]["maxzoom"]=7; json.dump(d, open(p, "w"))'
           
           tilemaker \
@@ -162,14 +163,18 @@ jobs:
           mbtiles_path = '/tmp/maps-output/nepal.mbtiles'
           map_target = '/tmp/maps-output/maps'
           os.makedirs(map_target, exist_ok=True)
+          
           src = sqlite3.connect(mbtiles_path)
           tiles = src.execute("SELECT tile_column, tile_row, tile_data FROM tiles WHERE zoom_level=7").fetchall()
+          
           now = int(time.time())
           tile_map = {}
+          
           for (x, tms_y, data) in tiles:
               y = (2**7 - 1) - tms_y
               tile_dir = f"{map_target}/{x}"
               os.makedirs(tile_dir, exist_ok=True)
+              
               tile_path = f"{tile_dir}/{x}-{y}.mtiles"
               dst = sqlite3.connect(tile_path)
               dst.execute("CREATE TABLE IF NOT EXISTS tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB)")
@@ -178,14 +183,19 @@ jobs:
               dst.execute("INSERT INTO tiles VALUES (7, ?, ?, ?)", (x, tms_y, data))
               dst.commit()
               dst.close()
+              
               tile_map[(x, y)] = os.path.getsize(tile_path)
+          
           src.close()
-          with open(f"{map_target}/index", 'wb') as f:
+          
+          # Generate Index with 'iI' (4-byte signed int for timestamp, 4-byte unsigned for size)
+          index_path = f"{map_target}/index"
+          with open(index_path, 'wb') as f:
               for x in range(128):
                   for y in range(128):
                       size = tile_map.get((x, y), 0)
-                      f.write(struct.pack('>hI', now if size > 0 else 0, size))
-              f.write(struct.pack('>hI', 0, 0))
+                      f.write(struct.pack('>iI', now if size > 0 else 0, size))
+              f.write(struct.pack('>iI', 0, 0))
           EOF
 
       - name: Create blank hillshade index
@@ -204,10 +214,20 @@ jobs:
           mkdir -p /tmp/gh-pages/hillshades
           cp -r /tmp/maps-output/maps/* /tmp/gh-pages/maps/
           cp -r /tmp/maps-output/hillshades/* /tmp/gh-pages/hillshades/
+          
           TILE_COUNT=$(find /tmp/gh-pages/maps -name "*.mtiles" | wc -l)
           BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
+          
           cat > /tmp/gh-pages/index.html << HTML
-          <html><body><h2>Trekarta Nepal Map Server</h2><p>Tiles: ${TILE_COUNT}</p><p>Updated: ${BUILD_DATE}</p></body></html>
+          <!DOCTYPE html>
+          <html>
+          <head><title>Trekarta Maps</title></head>
+          <body>
+            <h2>Trekarta Map Server</h2>
+            <p>Tiles (Zoom 7): ${TILE_COUNT}</p>
+            <p>Last Build: ${BUILD_DATE}</p>
+          </body>
+          </html>
           HTML
 
       - name: Deploy to GitHub Pages
@@ -217,3 +237,4 @@ jobs:
           publish_dir: /tmp/gh-pages
           publish_branch: gh-pages
           force_orphan: true
+          commit_message: "deploy: automated tile update ${{ github.sha }}"
