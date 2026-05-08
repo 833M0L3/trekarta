@@ -192,7 +192,7 @@ jobs:
 
           else
 
-            cp "${PBFS[0]}" /tmp/gis-data/source.osm.pbf"
+            cp "${PBFS[0]}" "/tmp/gis-data/source.osm.pbf"
 
           fi
 
