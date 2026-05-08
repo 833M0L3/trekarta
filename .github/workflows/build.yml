@@ -119,7 +119,29 @@ jobs:
 
       - name: Patch mapcreator for Shapely 2 compatibility
         run: |
-          sed -i "s/from shapely.ops import transform, linemerge, cascaded_union/from shapely.ops import transform, linemerge, unary_union as cascaded_union/" /tmp/mapcreator/mapwrite.py
+          python3 << 'EOF'
+          from pathlib import Path
+
+          root = Path('/tmp/mapcreator')
+          for path in root.rglob('*.py'):
+            text = path.read_text(encoding='utf-8')
+            patched = text
+
+            # from shapely.ops import a, b, cascaded_union
+            patched = patched.replace(
+              'from shapely.ops import transform, linemerge, cascaded_union',
+              'from shapely.ops import transform, linemerge, unary_union as cascaded_union'
+            )
+
+            # from shapely.ops import cascaded_union
+            patched = patched.replace(
+              'from shapely.ops import cascaded_union',
+              'from shapely.ops import unary_union as cascaded_union'
+            )
+
+            if patched != text:
+              path.write_text(patched, encoding='utf-8')
+          EOF
 
       - name: Patch mapcreator configuration for CI paths
         run: |
