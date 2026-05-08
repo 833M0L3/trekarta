@@ -33,6 +33,7 @@ jobs:
           VERSION_NAME=$(grep 'versionName' app/build.gradle | head -1 | sed 's/.*"\(.*\)".*/\1/' | tr -d '[:space:]')
           VERSION_CODE=$(grep 'versionCode' app/build.gradle | head -1 | grep -o '[0-9]*')
           COMMIT_SHORT=$(echo ${{ github.sha }} | cut -c1-7)
+
           echo "version_name=${VERSION_NAME}" >> $GITHUB_OUTPUT
           echo "version_code=${VERSION_CODE}" >> $GITHUB_OUTPUT
           echo "commit=${COMMIT_SHORT}" >> $GITHUB_OUTPUT
@@ -42,7 +43,7 @@ jobs:
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
+          distribution: temurin
           java-version: 17
 
       - name: Setup Android SDK
@@ -83,9 +84,8 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   # ============================================================
-  # JOB 2: Generate Nepal maps using tilemaker (no DB needed)
+  # JOB 2: Generate Nepal maps using tilemaker
   # + publish to GitHub Pages
-  # Only runs on master push or manual trigger
   # ============================================================
   publish-maps:
     name: Generate + Publish Maps
@@ -100,6 +100,7 @@ jobs:
       - name: Install tilemaker + dependencies
         run: |
           sudo apt-get update -qq
+
           sudo apt-get install -y \
             tilemaker \
             sqlite3 \
@@ -107,13 +108,14 @@ jobs:
             wget \
             osmium-tool \
             --no-install-recommends
+
           pip3 install mercantile
-          tilemaker --version
+
+          echo "Tilemaker installed successfully"
+          tilemaker -h | head -5
 
       - name: Get tilemaker config files
         run: |
-          TILEMAKER_VERSION=$(tilemaker --version 2>&1 | grep -o '[0-9]*\.[0-9]*\.[0-9]*' | head -1)
-          echo "Tilemaker version: $TILEMAKER_VERSION"
           git clone --depth=1 https://github.com/systemed/tilemaker.git /tmp/tilemaker-src
 
       - name: Create directories
@@ -125,22 +127,30 @@ jobs:
       - name: Download OSM data
         run: |
           REGIONS="${{ github.event.inputs.regions || 'asia/nepal' }}"
+
           IFS=',' read -ra REGION_LIST <<< "$REGIONS"
+
           for REGION in "${REGION_LIST[@]}"; do
             REGION=$(echo "$REGION" | xargs)
             FILENAME=$(basename "$REGION")
+
             echo "Downloading $REGION..."
+
             wget -q --show-progress \
               "https://download.geofabrik.de/${REGION}-latest.osm.pbf" \
               -O "/tmp/gis-data/${FILENAME}-latest.osm.pbf"
           done
 
           PBFS=(/tmp/gis-data/*-latest.osm.pbf)
+
           if [ ${#PBFS[@]} -gt 1 ]; then
-            osmium merge "${PBFS[@]}" -o /tmp/gis-data/source.osm.pbf --overwrite
+            osmium merge "${PBFS[@]}" \
+              -o /tmp/gis-data/source.osm.pbf \
+              --overwrite
           else
             cp "${PBFS[0]}" /tmp/gis-data/source.osm.pbf
           fi
+
           ls -lh /tmp/gis-data/source.osm.pbf
 
       - name: Generate mbtiles with tilemaker
@@ -152,35 +162,47 @@ jobs:
             --process /tmp/tilemaker-src/resources/process-openmaptiles.lua \
             --store /tmp/tilemaker-store \
             --verbose
+
           ls -lh /tmp/maps-output/nepal.mbtiles
 
       - name: Extract tiles into per-tile mtiles files + write index
         run: |
           python3 << 'EOF'
-          import sqlite3, os, struct, time
+          import sqlite3
+          import os
+          import struct
+          import time
 
           mbtiles_path = '/tmp/maps-output/nepal.mbtiles'
           map_target = '/tmp/maps-output/maps'
+
           os.makedirs(map_target, exist_ok=True)
 
           src = sqlite3.connect(mbtiles_path)
 
-          tiles = src.execute(
-              "SELECT tile_column, tile_row, tile_data FROM tiles WHERE zoom_level=7"
-          ).fetchall()
+          tiles = src.execute("""
+              SELECT tile_column, tile_row, tile_data
+              FROM tiles
+              WHERE zoom_level=7
+          """).fetchall()
+
           print(f"Found {len(tiles)} zoom-7 tiles")
 
           now = int(time.time())
           tile_map = {}
 
           for (x, tms_y, data) in tiles:
-              # mbtiles TMS y is flipped vs XYZ
+
+              # MBTiles uses TMS Y, Trekarta expects XYZ Y
               y = (2**7 - 1) - tms_y
+
               tile_dir = f"{map_target}/{x}"
               os.makedirs(tile_dir, exist_ok=True)
+
               tile_path = f"{tile_dir}/{x}-{y}.mtiles"
 
               dst = sqlite3.connect(tile_path)
+
               dst.execute("""
                   CREATE TABLE IF NOT EXISTS tiles (
                       zoom_level INTEGER,
@@ -189,55 +211,82 @@ jobs:
                       tile_data BLOB
                   )
               """)
+
               dst.execute("""
                   CREATE TABLE IF NOT EXISTS metadata (
                       name TEXT,
                       value TEXT
                   )
               """)
-              dst.execute("INSERT OR REPLACE INTO metadata VALUES ('timestamp', ?)", (str(now),))
-              dst.execute("INSERT INTO tiles VALUES (7, ?, ?, ?)", (x, tms_y, data))
+
+              dst.execute(
+                  "INSERT OR REPLACE INTO metadata VALUES ('timestamp', ?)",
+                  (str(now),)
+              )
+
+              dst.execute(
+                  "INSERT INTO tiles VALUES (7, ?, ?, ?)",
+                  (x, tms_y, data)
+              )
+
               dst.commit()
               dst.close()
 
               size = os.path.getsize(tile_path)
+
               tile_map[(x, y)] = size
-              print(f"  {x}-{y}.mtiles  ({size/1024:.1f} KB)")
+
+              print(f"  {x}-{y}.mtiles ({size/1024:.1f} KB)")
 
           src.close()
+
           print(f"\nTotal: {len(tile_map)} tiles written")
 
-          # Binary index: 128x128 cells * 6 bytes each + 6 bytes for basemap
           index_path = f"{map_target}/index"
+
           with open(index_path, 'wb') as f:
+
               for x in range(128):
                   for y in range(128):
+
                       size = tile_map.get((x, y), 0)
                       date = now if size > 0 else 0
+
                       f.write(struct.pack('>hI', date, size))
-              # basemap entry (empty)
+
+              # basemap entry
               f.write(struct.pack('>hI', 0, 0))
 
-          print(f"Index written: {len(tile_map)} non-empty tiles, {os.path.getsize(index_path)} bytes")
+          print(
+              f"Index written: {len(tile_map)} non-empty tiles, "
+              f"{os.path.getsize(index_path)} bytes"
+          )
+
           EOF
 
       - name: Create blank hillshade index
         run: |
           python3 << 'EOF'
-          import struct, os
+          import struct
+          import os
+
           os.makedirs('/tmp/maps-output/hillshades', exist_ok=True)
+
           with open('/tmp/maps-output/hillshades/index', 'wb') as f:
               for _ in range(128 * 128):
                   f.write(struct.pack('>bI', 0, 0))
+
           print("Blank hillshade index written")
           EOF
 
       - name: List generated files
         run: |
           echo "=== Maps ==="
+
           find /tmp/maps-output/maps -type f | sort | while read f; do
             echo "  $(du -h $f | cut -f1)  $f"
           done
+
           echo ""
           echo "Index size: $(du -h /tmp/maps-output/maps/index | cut -f1)"
           echo "Total tiles: $(find /tmp/maps-output/maps -name '*.mtiles' | wc -l)"
@@ -259,27 +308,89 @@ jobs:
           <html>
           <head>
             <title>Trekarta Map Server — Nepal</title>
+
             <style>
-              body { font-family: sans-serif; max-width: 640px; margin: 40px auto; padding: 0 20px; color: #333; }
-              code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }
-              table { border-collapse: collapse; width: 100%; margin: 16px 0; }
-              td { padding: 6px 12px; border-bottom: 1px solid #eee; }
-              td:first-child { font-weight: bold; width: 140px; }
+              body {
+                font-family: sans-serif;
+                max-width: 640px;
+                margin: 40px auto;
+                padding: 0 20px;
+                color: #333;
+              }
+
+              code {
+                background: #f4f4f4;
+                padding: 2px 6px;
+                border-radius: 3px;
+                font-size: 0.9em;
+              }
+
+              table {
+                border-collapse: collapse;
+                width: 100%;
+                margin: 16px 0;
+              }
+
+              td {
+                padding: 6px 12px;
+                border-bottom: 1px solid #eee;
+              }
+
+              td:first-child {
+                font-weight: bold;
+                width: 140px;
+              }
             </style>
           </head>
+
           <body>
             <h2>🗺 Trekarta Map Server</h2>
-            <p>Serving Nepal map tiles for the custom Trekarta build.</p>
+
+            <p>
+              Serving Nepal map tiles for the custom Trekarta build.
+            </p>
+
             <table>
-              <tr><td>Tiles available</td><td>${TILE_COUNT}</td></tr>
-              <tr><td>Region</td><td>Nepal (asia/nepal)</td></tr>
-              <tr><td>Last updated</td><td>${BUILD_DATE}</td></tr>
-              <tr><td>Commit</td><td>${COMMIT_SHORT}</td></tr>
+              <tr>
+                <td>Tiles available</td>
+                <td>${TILE_COUNT}</td>
+              </tr>
+
+              <tr>
+                <td>Region</td>
+                <td>Nepal (asia/nepal)</td>
+              </tr>
+
+              <tr>
+                <td>Last updated</td>
+                <td>${BUILD_DATE}</td>
+              </tr>
+
+              <tr>
+                <td>Commit</td>
+                <td>${COMMIT_SHORT}</td>
+              </tr>
             </table>
+
             <h3>Endpoints</h3>
-            <p><code>https://833m0l3.github.io/trekarta/maps/{x}/{x}-{y}.mtiles</code></p>
-            <p><code>https://833m0l3.github.io/trekarta/maps/index</code></p>
-            <p><code>https://833m0l3.github.io/trekarta/hillshades/index</code></p>
+
+            <p>
+              <code>
+                https://833m0l3.github.io/trekarta/maps/{x}/{x}-{y}.mtiles
+              </code>
+            </p>
+
+            <p>
+              <code>
+                https://833m0l3.github.io/trekarta/maps/index
+              </code>
+            </p>
+
+            <p>
+              <code>
+                https://833m0l3.github.io/trekarta/hillshades/index
+              </code>
+            </p>
           </body>
           </html>
           HTML
