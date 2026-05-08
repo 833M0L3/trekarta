@@ -15,14 +15,12 @@ permissions:
   id-token: write
 
 jobs:
-
   # ============================================================
   # Build APK
   # ============================================================
   build-apk:
     name: Build APK
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,7 +31,6 @@ jobs:
           VERSION_NAME=$(grep 'versionName' app/build.gradle | head -1 | sed 's/.*"\(.*\)".*/\1/' | tr -d '[:space:]')
           VERSION_CODE=$(grep 'versionCode' app/build.gradle | head -1 | grep -o '[0-9]*')
           COMMIT_SHORT=$(echo ${{ github.sha }} | cut -c1-7)
-
           echo "version_name=${VERSION_NAME}" >> $GITHUB_OUTPUT
           echo "version_code=${VERSION_CODE}" >> $GITHUB_OUTPUT
           echo "commit=${COMMIT_SHORT}" >> $GITHUB_OUTPUT
@@ -78,7 +75,6 @@ jobs:
             Build: ${{ steps.version.outputs.version_code }}
             Commit: ${{ github.sha }}
             Branch: ${{ github.ref_name }}
-
             Custom Trekarta build with GitHub Pages map hosting.
           files: app/build/outputs/apk/debug/${{ steps.version.outputs.apk_name }}
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -90,128 +86,67 @@ jobs:
     name: Generate + Publish Maps
     runs-on: ubuntu-latest
     timeout-minutes: 180
-
     if: github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ========================================================
-      # Install dependencies
-      # ========================================================
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-
           sudo apt-get install -y \
-            build-essential \
-            cmake \
-            libboost-dev \
-            libboost-program-options-dev \
-            libboost-filesystem-dev \
-            libboost-system-dev \
-            libboost-iostreams-dev \
-            liblua5.1-0-dev \
-            libshp-dev \
-            lua5.1 \
-            libprotobuf-dev \
-            protobuf-compiler \
-            zlib1g-dev \
-            rapidjson-dev \
-            wget \
-            git \
-            sqlite3 \
-            osmium-tool \
-            python3-pip \
+            build-essential cmake libboost-dev libboost-program-options-dev \
+            libboost-filesystem-dev libboost-system-dev libboost-iostreams-dev \
+            liblua5.1-0-dev lua5.1 libprotobuf-dev protobuf-compiler \
+            zlib1g-dev rapidjson-dev libshp-dev libsqlite3-dev \
+            wget git sqlite3 osmium-tool python3-pip \
             --no-install-recommends
-
           pip3 install mercantile
 
-      # ========================================================
-      # Build latest tilemaker from GitHub
-      # ========================================================
       - name: Clone tilemaker
-        run: |
-          git clone --depth=1 https://github.com/systemed/tilemaker.git /tmp/tilemaker
+        run: git clone --depth=1 https://github.com/systemed/tilemaker.git /tmp/tilemaker
 
       - name: Build tilemaker
         run: |
           cd /tmp/tilemaker
-
-          mkdir build
-          cd build
-
+          mkdir build && cd build
           cmake ..
-
           make -j$(nproc)
-
           sudo make install
 
-          tilemaker --help | head
-
-      # ========================================================
-      # Create directories
-      # ========================================================
       - name: Create directories
         run: |
           mkdir -p /tmp/gis-data
           mkdir -p /tmp/maps-output/maps
           mkdir -p /tmp/maps-output/hillshades
+          mkdir -p /tmp/tilemaker-store
 
-      # ========================================================
-      # Download OSM
-      # ========================================================
       - name: Download OSM data
         run: |
           REGIONS="${{ github.event.inputs.regions || 'asia/nepal' }}"
-
           IFS=',' read -ra REGION_LIST <<< "$REGIONS"
-
           for REGION in "${REGION_LIST[@]}"; do
-
             REGION=$(echo "$REGION" | xargs)
-
             FILENAME=$(basename "$REGION")
-
             echo "Downloading $REGION"
-
             wget -q --show-progress \
               "https://download.geofabrik.de/${REGION}-latest.osm.pbf" \
               -O "/tmp/gis-data/${FILENAME}-latest.osm.pbf"
-
           done
 
           PBFS=(/tmp/gis-data/*-latest.osm.pbf)
-
           if [ ${#PBFS[@]} -gt 1 ]; then
-
-            osmium merge "${PBFS[@]}" \
-              -o /tmp/gis-data/source.osm.pbf \
-              --overwrite
-
+            osmium merge "${PBFS[@]}" -o /tmp/gis-data/source.osm.pbf --overwrite
           else
-
             cp "${PBFS[0]}" "/tmp/gis-data/source.osm.pbf"
-
           fi
 
-          ls -lh /tmp/gis-data/source.osm.pbf
-
-      # ========================================================
-      # Generate MBTiles
-      # ========================================================
       - name: Generate MBTiles
         run: |
-          python3 -c '
-            import json
-            path = "/tmp/tilemaker/resources/config-openmaptiles.json"
-            with open(path, "r") as f:
-                data = json.load(f)
-            data["settings"]["maxzoom"] = 7
-            with open(path, "w") as f:
-                json.dump(data, f, indent=4)
-            '
+          # Safe JSON update for maxzoom
+          python3 -c 'import json; p="/tmp/tilemaker/resources/config-openmaptiles.json"; d=json.load(open(p)); d["settings"]["maxzoom"]=7; json.dump(d, open(p, "w"))'
+          
           tilemaker \
             --input /tmp/gis-data/source.osm.pbf \
             --output /tmp/maps-output/nepal.mbtiles \
@@ -220,158 +155,61 @@ jobs:
             --store /tmp/tilemaker-store \
             --verbose
 
-          ls -lh /tmp/maps-output/nepal.mbtiles
-
-      # ========================================================
-      # Convert to Trekarta .mtiles
-      # ========================================================
       - name: Extract Trekarta map tiles
         run: |
           python3 << 'EOF'
-          import sqlite3
-          import os
-          import struct
-          import time
-
+          import sqlite3, os, struct, time
           mbtiles_path = '/tmp/maps-output/nepal.mbtiles'
           map_target = '/tmp/maps-output/maps'
-
           os.makedirs(map_target, exist_ok=True)
-
           src = sqlite3.connect(mbtiles_path)
-
-          tiles = src.execute("""
-              SELECT tile_column, tile_row, tile_data
-              FROM tiles
-              WHERE zoom_level=7
-          """).fetchall()
-
-          print(f"Found {len(tiles)} tiles")
-
+          tiles = src.execute("SELECT tile_column, tile_row, tile_data FROM tiles WHERE zoom_level=7").fetchall()
           now = int(time.time())
-
           tile_map = {}
-
           for (x, tms_y, data) in tiles:
-
               y = (2**7 - 1) - tms_y
-
               tile_dir = f"{map_target}/{x}"
               os.makedirs(tile_dir, exist_ok=True)
-
               tile_path = f"{tile_dir}/{x}-{y}.mtiles"
-
               dst = sqlite3.connect(tile_path)
-
-              dst.execute("""
-                  CREATE TABLE IF NOT EXISTS tiles (
-                      zoom_level INTEGER,
-                      tile_column INTEGER,
-                      tile_row INTEGER,
-                      tile_data BLOB
-                  )
-              """)
-
-              dst.execute("""
-                  CREATE TABLE IF NOT EXISTS metadata (
-                      name TEXT,
-                      value TEXT
-                  )
-              """)
-
-              dst.execute(
-                  "INSERT OR REPLACE INTO metadata VALUES ('timestamp', ?)",
-                  (str(now),)
-              )
-
-              dst.execute(
-                  "INSERT INTO tiles VALUES (7, ?, ?, ?)",
-                  (x, tms_y, data)
-              )
-
+              dst.execute("CREATE TABLE IF NOT EXISTS tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB)")
+              dst.execute("CREATE TABLE IF NOT EXISTS metadata (name TEXT, value TEXT)")
+              dst.execute("INSERT OR REPLACE INTO metadata VALUES ('timestamp', ?)", (str(now),))
+              dst.execute("INSERT INTO tiles VALUES (7, ?, ?, ?)", (x, tms_y, data))
               dst.commit()
               dst.close()
-
-              size = os.path.getsize(tile_path)
-
-              tile_map[(x, y)] = size
-
-              print(f"{x}-{y}.mtiles ({size/1024:.1f} KB)")
-
+              tile_map[(x, y)] = os.path.getsize(tile_path)
           src.close()
-
-          index_path = f"{map_target}/index"
-
-          with open(index_path, 'wb') as f:
-
+          with open(f"{map_target}/index", 'wb') as f:
               for x in range(128):
                   for y in range(128):
-
                       size = tile_map.get((x, y), 0)
-                      date = now if size > 0 else 0
-
-                      f.write(struct.pack('>hI', date, size))
-
+                      f.write(struct.pack('>hI', now if size > 0 else 0, size))
               f.write(struct.pack('>hI', 0, 0))
-
-          print("Index generated")
-
           EOF
 
-      # ========================================================
-      # Blank hillshade index
-      # ========================================================
       - name: Create blank hillshade index
         run: |
           python3 << 'EOF'
-          import struct
-          import os
-
+          import struct, os
           os.makedirs('/tmp/maps-output/hillshades', exist_ok=True)
-
           with open('/tmp/maps-output/hillshades/index', 'wb') as f:
               for _ in range(128 * 128):
                   f.write(struct.pack('>bI', 0, 0))
-
-          print("Hillshade index generated")
           EOF
 
-      # ========================================================
-      # Prepare GitHub Pages
-      # ========================================================
       - name: Prepare GitHub Pages
         run: |
           mkdir -p /tmp/gh-pages/maps
           mkdir -p /tmp/gh-pages/hillshades
-
           cp -r /tmp/maps-output/maps/* /tmp/gh-pages/maps/
           cp -r /tmp/maps-output/hillshades/* /tmp/gh-pages/hillshades/
-
           TILE_COUNT=$(find /tmp/gh-pages/maps -name "*.mtiles" | wc -l)
           BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
-
           cat > /tmp/gh-pages/index.html << HTML
-          <!DOCTYPE html>
-          <html>
-          <head>
-            <title>Trekarta Nepal Maps</title>
-          </head>
-          <body>
-            <h2>Trekarta Nepal Map Server</h2>
-
-            <p>Tiles: ${TILE_COUNT}</p>
-            <p>Updated: ${BUILD_DATE}</p>
-
-            <p>
-              https://833m0l3.github.io/trekarta/maps/
-            </p>
-          </body>
-          </html>
+          <html><body><h2>Trekarta Nepal Map Server</h2><p>Tiles: ${TILE_COUNT}</p><p>Updated: ${BUILD_DATE}</p></body></html>
           HTML
 
-      # ========================================================
-      # Deploy Pages
-      # ========================================================
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
         with:
@@ -379,4 +217,3 @@ jobs:
           publish_dir: /tmp/gh-pages
           publish_branch: gh-pages
           force_orphan: true
-          commit_message: "deploy: Nepal maps ${{ github.sha }}"
