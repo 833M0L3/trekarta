@@ -168,6 +168,9 @@ jobs:
           tiles = src.execute("SELECT tile_column, tile_row, tile_data FROM tiles WHERE zoom_level=7").fetchall()
           
           now = int(time.time())
+          # Java reads 'short date' (2 bytes) + 'int size' (4 bytes) per entry.
+          # Compact date: days since 2000-01-01 — fits in a short (max 32767).
+          date_short = (now - 946684800) // 86400
           tile_map = {}
           
           for (x, tms_y, data) in tiles:
@@ -188,14 +191,14 @@ jobs:
           
           src.close()
           
-          # Generate Index with 'iI' (4-byte signed int for timestamp, 4-byte unsigned for size)
+          # Index format: short date (2 bytes) + unsigned int size (4 bytes) = 6 bytes per entry
           index_path = f"{map_target}/index"
           with open(index_path, 'wb') as f:
               for x in range(128):
                   for y in range(128):
                       size = tile_map.get((x, y), 0)
-                      f.write(struct.pack('>iI', now if size > 0 else 0, size))
-              f.write(struct.pack('>iI', 0, 0))
+                      f.write(struct.pack('>hI', date_short if size > 0 else 0, size))
+              f.write(struct.pack('>hI', 0, 0))
           EOF
 
       - name: Create blank hillshade index
