@@ -4,6 +4,14 @@ on:
   push:
   workflow_dispatch:
     inputs:
+      build_apk:
+        description: 'Build APK'
+        required: false
+        default: 'true'
+      publish_maps:
+        description: 'Generate and publish maps'
+        required: false
+        default: 'true'
       regions:
         description: 'Geofabrik regions (comma-separated)'
         required: false
@@ -25,6 +33,7 @@ jobs:
   build-apk:
     name: Build APK
     runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.build_apk == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -91,7 +100,7 @@ jobs:
     name: Generate + Publish Maps
     runs-on: ubuntu-latest
     timeout-minutes: 180
-    if: github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
+    if: (github.ref == 'refs/heads/master' && github.event_name != 'workflow_dispatch') || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_maps == 'true')
 
     steps:
       - name: Checkout
@@ -107,6 +116,10 @@ jobs:
 
       - name: Clone mapcreator
         run: git clone --depth=1 https://github.com/andreynovikov/mapcreator.git /tmp/mapcreator
+
+      - name: Patch mapcreator for Shapely 2 compatibility
+        run: |
+          sed -i "s/from shapely.ops import transform, linemerge, cascaded_union/from shapely.ops import transform, linemerge, unary_union as cascaded_union/" /tmp/mapcreator/mapwrite.py
 
       - name: Patch mapcreator configuration for CI paths
         run: |
