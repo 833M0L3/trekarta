@@ -17,8 +17,7 @@ permissions:
 jobs:
 
   # ============================================================
-  # JOB 1: Build the APK from YOUR fork (with Index.java patched
-  # to point to 833m0l3.github.io)
+  # JOB 1: Build APK + publish to GitHub Releases
   # ============================================================
   build-apk:
     name: Build APK
@@ -27,6 +26,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Get version from build.gradle
+        id: version
+        run: |
+          VERSION_NAME=$(grep 'versionName' app/build.gradle | head -1 | sed 's/.*"\(.*\)".*/\1/' | tr -d '[:space:]')
+          VERSION_CODE=$(grep 'versionCode' app/build.gradle | head -1 | grep -o '[0-9]*')
+          COMMIT_SHORT=$(echo ${{ github.sha }} | cut -c1-7)
+          echo "version_name=${VERSION_NAME}" >> $GITHUB_OUTPUT
+          echo "version_code=${VERSION_CODE}" >> $GITHUB_OUTPUT
+          echo "commit=${COMMIT_SHORT}" >> $GITHUB_OUTPUT
+          echo "tag=v${VERSION_NAME}-${COMMIT_SHORT}" >> $GITHUB_OUTPUT
+          echo "apk_name=trekarta-v${VERSION_NAME}-${COMMIT_SHORT}.apk" >> $GITHUB_OUTPUT
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -51,19 +62,33 @@ jobs:
         env:
           GRADLE_OPTS: "-Xmx4096m"
 
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+      - name: Rename APK
+        run: |
+          mv app/build/outputs/apk/debug/app-debug.apk \
+             app/build/outputs/apk/debug/${{ steps.version.outputs.apk_name }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: trekarta-debug-${{ github.sha }}
-          path: app/build/outputs/apk/debug/*.apk
-          retention-days: 30
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "Trekarta ${{ steps.version.outputs.version_name }} (${{ steps.version.outputs.commit }})"
+          body: |
+            **Version:** ${{ steps.version.outputs.version_name }}
+            **Build:** ${{ steps.version.outputs.version_code }}
+            **Commit:** ${{ github.sha }}
+            **Branch:** ${{ github.ref_name }}
+
+            > Debug build — points to GitHub Pages map server
+          files: app/build/outputs/apk/debug/${{ steps.version.outputs.apk_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # ============================================================
-  # JOB 2: Generate Nepal map tiles and publish to GitHub Pages
+  # JOB 2: Generate Nepal maps using tilemaker (no DB needed)
+  # + publish to GitHub Pages
   # Only runs on master push or manual trigger
   # ============================================================
   publish-maps:
-    name: Generate + Publish Maps to GitHub Pages
+    name: Generate + Publish Maps
     runs-on: ubuntu-latest
     timeout-minutes: 180
     if: github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
@@ -72,22 +97,39 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install tilemaker + dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y osmium-tool osmctools sqlite3 python3-pip --no-install-recommends
-          pip3 install osmium mercantile shapely tqdm protobuf
+          sudo apt-get install -y \
+            sqlite3 python3-pip wget \
+            libboost-filesystem-dev \
+            libboost-iostreams-dev \
+            libboost-program-options-dev \
+            libboost-system-dev \
+            liblua5.1-0-dev \
+            libshp-dev \
+            libsqlite3-dev \
+            --no-install-recommends
 
-      - name: Clone mapcreator
-        run: git clone --depth=1 https://github.com/andreynovikov/mapcreator.git /tmp/mapcreator
+          # Install tilemaker binary
+          wget -q https://github.com/systemed/tilemaker/releases/download/v2.4.0/tilemaker-ubuntu-22.04.gz
+          gunzip tilemaker-ubuntu-22.04.gz
+          chmod +x tilemaker-ubuntu-22.04
+          sudo mv tilemaker-ubuntu-22.04 /usr/local/bin/tilemaker
 
-      - name: Create working directories
+          pip3 install mercantile
+
+      - name: Clone tilemaker resources (lua scripts + config)
+        run: |
+          git clone --depth=1 https://github.com/systemed/tilemaker.git /tmp/tilemaker-src
+
+      - name: Create directories
         run: |
           mkdir -p /tmp/gis-data
           mkdir -p /tmp/maps-output/maps
           mkdir -p /tmp/maps-output/hillshades
 
-      - name: Download OSM data from Geofabrik
+      - name: Download OSM data
         run: |
           REGIONS="${{ github.event.inputs.regions || 'asia/nepal' }}"
           IFS=',' read -ra REGION_LIST <<< "$REGIONS"
@@ -99,141 +141,162 @@ jobs:
               "https://download.geofabrik.de/${REGION}-latest.osm.pbf" \
               -O "/tmp/gis-data/${FILENAME}-latest.osm.pbf"
           done
+
+          # Merge if multiple regions
           PBFS=(/tmp/gis-data/*-latest.osm.pbf)
           if [ ${#PBFS[@]} -gt 1 ]; then
+            sudo apt-get install -y osmium-tool -qq
             osmium merge "${PBFS[@]}" -o /tmp/gis-data/source.osm.pbf --overwrite
           else
             cp "${PBFS[0]}" /tmp/gis-data/source.osm.pbf
           fi
           ls -lh /tmp/gis-data/source.osm.pbf
 
-      - name: Find tiles covering region
+      - name: Generate mbtiles with tilemaker
+        run: |
+          tilemaker \
+            --input /tmp/gis-data/source.osm.pbf \
+            --output /tmp/maps-output/nepal.mbtiles \
+            --config /tmp/tilemaker-src/resources/config-openmaptiles.json \
+            --process /tmp/tilemaker-src/resources/process-openmaptiles.lua \
+            --store /tmp/tilemaker-store \
+            --verbose
+
+          ls -lh /tmp/maps-output/nepal.mbtiles
+
+      - name: Extract tiles from mbtiles into mtiles per-tile files
         run: |
           python3 << 'EOF'
-          import mercantile, osmium, json, os
+          import sqlite3, os, struct, mercantile
 
-          class BboxHandler(osmium.SimpleHandler):
-              def __init__(self):
-                  super().__init__()
-                  self.min_lon, self.max_lon = 180, -180
-                  self.min_lat, self.max_lat = 90, -90
-              def node(self, n):
-                  self.min_lon = min(self.min_lon, n.location.lon)
-                  self.max_lon = max(self.max_lon, n.location.lon)
-                  self.min_lat = min(self.min_lat, n.location.lat)
-                  self.max_lat = max(self.max_lat, n.location.lat)
-
-          h = BboxHandler()
-          h.apply_file('/tmp/gis-data/source.osm.pbf', locations=False)
-          print(f"BBox: {h.min_lon:.4f},{h.min_lat:.4f},{h.max_lon:.4f},{h.max_lat:.4f}")
-
-          tiles = list(mercantile.tiles(h.min_lon, h.min_lat, h.max_lon, h.max_lat, zooms=7))
-          tile_list = [f"{t.x}-{t.y}" for t in tiles]
-          print(f"Tiles ({len(tiles)}): {tile_list}")
-
-          with open('/tmp/tiles.json', 'w') as f:
-              json.dump(tile_list, f)
-          EOF
-
-      - name: Generate map tiles
-        run: |
-          python3 << 'EOF'
-          import json, subprocess, sys, os
-
-          with open('/tmp/tiles.json') as f:
-              tiles = json.load(f)
-
+          mbtiles_path = '/tmp/maps-output/nepal.mbtiles'
           map_target = '/tmp/maps-output/maps'
-          data_path = '/tmp/gis-data'
-          mapcreator = '/tmp/mapcreator'
+          os.makedirs(map_target, exist_ok=True)
 
-          failed = []
-          for tile in tiles:
-              x, y = map(int, tile.split('-'))
-              os.makedirs(f"{map_target}/{x}", exist_ok=True)
-              print(f"\nGenerating tile {x}-{y}...")
-              result = subprocess.run(
-                  [sys.executable, f"{mapcreator}/mapwrite.py",
-                   '--from-file', '--log', 'INFO',
-                   '--data-path', data_path, str(x), str(y)],
-                  timeout=1800
-              )
-              if result.returncode != 0:
-                  print(f"WARNING: tile {x}-{y} failed")
-                  failed.append(tile)
-              else:
-                  src = f"{data_path}/{x}-{y}.mtiles"
-                  dst = f"{map_target}/{x}/{x}-{y}.mtiles"
-                  if os.path.exists(src):
-                      os.rename(src, dst)
-                      print(f"  OK: {os.path.getsize(dst)/1024:.1f} KB")
+          src = sqlite3.connect(mbtiles_path)
 
-          print(f"\nDone. Failed: {failed or 'none'}")
-          EOF
+          # Get all zoom-7 tiles
+          tiles = src.execute(
+              "SELECT tile_column, tile_row, tile_data FROM tiles WHERE zoom_level=7"
+          ).fetchall()
 
-      - name: Generate binary index
-        run: |
-          python3 << 'EOF'
-          import os, sqlite3, struct
+          print(f"Found {len(tiles)} zoom-7 tiles")
 
-          map_target = '/tmp/maps-output/maps'
+          written = []
+          for (x, tms_y, data) in tiles:
+              # mbtiles uses TMS y (flipped), convert to XYZ
+              y = (2**7 - 1) - tms_y
+              tile_dir = f"{map_target}/{x}"
+              os.makedirs(tile_dir, exist_ok=True)
+              tile_path = f"{tile_dir}/{x}-{y}.mtiles"
 
-          def mapinfo(x, y):
-              path = f"{map_target}/basemap.mtiles" if x == -1 else f"{map_target}/{x}/{x}-{y}.mtiles"
-              if not os.path.exists(path) or os.path.getsize(path) == 0:
-                  return 0, 0
-              try:
-                  with sqlite3.connect(path) as db:
-                      row = db.execute("SELECT value FROM metadata WHERE name='timestamp'").fetchone()
-                      return os.path.getsize(path), int(row[0]) if row else 0
-              except:
-                  return os.path.getsize(path), 0
+              # Each .mtiles is a minimal sqlite with the tile data
+              dst = sqlite3.connect(tile_path)
+              dst.execute("""
+                  CREATE TABLE IF NOT EXISTS tiles (
+                      zoom_level INTEGER,
+                      tile_column INTEGER,
+                      tile_row INTEGER,
+                      tile_data BLOB
+                  )
+              """)
+              dst.execute("""
+                  CREATE TABLE IF NOT EXISTS metadata (
+                      name TEXT,
+                      value TEXT
+                  )
+              """)
+              import time
+              dst.execute("INSERT OR REPLACE INTO metadata VALUES ('timestamp', ?)",
+                          (str(int(time.time())),))
+              dst.execute("INSERT INTO tiles VALUES (7, ?, ?, ?)", (x, tms_y, data))
+              dst.commit()
+              dst.close()
+              size = os.path.getsize(tile_path)
+              print(f"  Written {x}-{y}.mtiles ({size/1024:.1f} KB)")
+              written.append((x, y, size))
 
-          with open(f"{map_target}/index", 'wb') as f:
-              count = 0
+          src.close()
+          print(f"\nTotal: {len(written)} tiles written")
+
+          # Write binary index (128x128 grid * 6 bytes + 6 bytes basemap)
+          index_path = f"{map_target}/index"
+          tile_map = {(x, y): size for x, y, size in written}
+          import time as t
+          now = int(t.time())
+
+          with open(index_path, 'wb') as f:
               for x in range(128):
                   for y in range(128):
-                      size, date = mapinfo(x, y)
+                      size = tile_map.get((x, y), 0)
+                      date = now if size > 0 else 0
                       f.write(struct.pack('>hI', date, size))
-                      if size > 0: count += 1
-              size, date = mapinfo(-1, -1)
-              f.write(struct.pack('>hI', date, size))
-          print(f"Index written: {count} non-empty tiles")
+              # basemap entry (none)
+              f.write(struct.pack('>hI', 0, 0))
+
+          print(f"Index written: {len(written)} non-empty tiles")
           EOF
+
+      - name: Create blank hillshade index
+        run: |
+          python3 << 'EOF'
+          import struct, os
+          os.makedirs('/tmp/maps-output/hillshades', exist_ok=True)
+          with open('/tmp/maps-output/hillshades/index', 'wb') as f:
+              for _ in range(128 * 128):
+                  f.write(struct.pack('>bI', 0, 0))
+          print("Blank hillshade index written")
+          EOF
+
+      - name: List generated files
+        run: |
+          echo "=== Maps ==="
+          find /tmp/maps-output/maps -type f | sort | while read f; do
+            echo "  $(du -h $f | cut -f1)  $f"
+          done
 
       - name: Prepare GitHub Pages content
         run: |
           mkdir -p /tmp/gh-pages/maps
           mkdir -p /tmp/gh-pages/hillshades
 
-          # Copy map tiles preserving directory structure
           cp -r /tmp/maps-output/maps/* /tmp/gh-pages/maps/ 2>/dev/null || true
           cp -r /tmp/maps-output/hillshades/* /tmp/gh-pages/hillshades/ 2>/dev/null || true
 
-          # Create a simple index.html so Pages doesn't show a blank site
-          cat > /tmp/gh-pages/index.html << 'HTML'
+          # Count tiles for status page
+          TILE_COUNT=$(find /tmp/gh-pages/maps -name "*.mtiles" | wc -l)
+          BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
+
+          cat > /tmp/gh-pages/index.html << HTML
           <!DOCTYPE html>
           <html>
-          <head><title>Trekarta Map Server</title></head>
+          <head>
+            <title>Trekarta Map Server — Nepal</title>
+            <style>
+              body { font-family: sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; }
+              code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; }
+            </style>
+          </head>
           <body>
-          <h2>Trekarta Map Server</h2>
-          <p>This GitHub Pages site serves map tiles for the Trekarta app.</p>
-          <p>Map files are served from <code>/maps/</code> and <code>/hillshades/</code></p>
-          <p>Last updated: <script>document.write(new Date().toISOString())</script></p>
+            <h2>Trekarta Map Server</h2>
+            <p>Serving Nepal map tiles for the custom Trekarta build.</p>
+            <table>
+              <tr><td><b>Tiles available:</b></td><td>${TILE_COUNT}</td></tr>
+              <tr><td><b>Region:</b></td><td>Nepal (asia/nepal)</td></tr>
+              <tr><td><b>Last updated:</b></td><td>${BUILD_DATE}</td></tr>
+            </table>
+            <h3>Endpoints</h3>
+            <p><code>https://833m0l3.github.io/trekarta/maps/{x}/{x}-{y}.mtiles</code></p>
+            <p><code>https://833m0l3.github.io/trekarta/maps/index</code></p>
           </body>
           </html>
           HTML
 
-          echo "=== Pages content ==="
-          find /tmp/gh-pages -type f | sort | while read f; do
-            echo "  $(du -h $f | cut -f1) $f"
-          done
-
-      - name: Deploy to GitHub Pages (gh-pages branch)
+      - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: /tmp/gh-pages
           publish_branch: gh-pages
           force_orphan: true
-          commit_message: "deploy: update Nepal maps ${{ github.sha }}"
+          commit_message: "deploy: Nepal maps ${{ github.sha }}"
