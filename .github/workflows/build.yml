@@ -101,31 +101,26 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y \
-            build-essential cmake libboost-dev libboost-program-options-dev \
-            libboost-filesystem-dev libboost-system-dev libboost-iostreams-dev \
-            liblua5.1-0-dev lua5.1 libprotobuf-dev protobuf-compiler \
-            zlib1g-dev rapidjson-dev libshp-dev libsqlite3-dev \
-            wget git sqlite3 osmium-tool python3-pip \
+            wget git sqlite3 osmium-tool osmctools python3-pip \
             --no-install-recommends
-          pip3 install mercantile
+          pip3 install mercantile pyosmium shapely psutil setproctitle tqdm psycopg2-binary
 
-      - name: Clone tilemaker
-        run: git clone --depth=1 https://github.com/systemed/tilemaker.git /tmp/tilemaker
+      - name: Clone mapcreator
+        run: git clone --depth=1 https://github.com/andreynovikov/mapcreator.git /tmp/mapcreator
 
-      - name: Build tilemaker
+      - name: Patch mapcreator configuration for CI paths
         run: |
-          cd /tmp/tilemaker
-          mkdir build && cd build
-          cmake ..
-          make -j$(nproc)
-          sudo make install
+          sed -i "s|^SOURCE_PBF = .*|SOURCE_PBF = '/tmp/gis-data/source.osm.pbf'|" /tmp/mapcreator/configuration.py
+          sed -i "s|^MAP_TARGET_PATH = .*|MAP_TARGET_PATH = '/tmp/maps-output/maps'|" /tmp/mapcreator/configuration.py
+          sed -i "s|^LOGGING_PATH = .*|LOGGING_PATH = '/tmp'|" /tmp/mapcreator/configuration.py
+          sed -i "s|^DATA_PATH = .*|DATA_PATH = '/tmp/gis-data'|" /tmp/mapcreator/configuration.py
+          sed -i "s|^FILTERS_PATH = .*|FILTERS_PATH = '/tmp/mapcreator/filters'|" /tmp/mapcreator/configuration.py
 
       - name: Create directories
         run: |
           mkdir -p /tmp/gis-data
           mkdir -p /tmp/maps-output/maps
           mkdir -p /tmp/maps-output/hillshades
-          mkdir -p /tmp/tilemaker-store
 
       - name: Download OSM data
         run: |
@@ -147,88 +142,77 @@ jobs:
             cp "${PBFS[0]}" "/tmp/gis-data/source.osm.pbf"
           fi
 
-      - name: Generate MBTiles
+      - name: Generate Trekarta native map tiles
         run: |
-          MAX_ZOOM="${{ github.event.inputs.maxzoom || '10' }}"
-          # Use Python for a syntax-safe JSON modification
-          python3 -c "import json; p='/tmp/tilemaker/resources/config-openmaptiles.json'; d=json.load(open(p)); d['settings']['maxzoom']=int('${MAX_ZOOM}'); json.dump(d, open(p, 'w'))"
-          
-          tilemaker \
-            --input /tmp/gis-data/source.osm.pbf \
-            --output /tmp/maps-output/nepal.mbtiles \
-            --config /tmp/tilemaker/resources/config-openmaptiles.json \
-            --process /tmp/tilemaker/resources/process-openmaptiles.lua \
-            --store /tmp/tilemaker-store \
-            --verbose
-
-      - name: Extract Trekarta map tiles
-        run: |
-          MAX_ZOOM="${{ github.event.inputs.maxzoom || '10' }}"
           python3 << 'EOF'
-          import sqlite3, os, struct
-          mbtiles_path = '/tmp/maps-output/nepal.mbtiles'
+          import os
+          import re
+          import glob
+          import shutil
+          import struct
+          import sqlite3
+          import subprocess
+          import mercantile
+
+          source_pbf = '/tmp/gis-data/source.osm.pbf'
           map_target = '/tmp/maps-output/maps'
           os.makedirs(map_target, exist_ok=True)
-          max_zoom = int(os.environ.get('MAX_ZOOM', '10'))
-          if max_zoom < 7:
-            max_zoom = 7
-          
-          src = sqlite3.connect(mbtiles_path)
-          cursor = src.execute(
-            "SELECT zoom_level, tile_column, tile_row, tile_data "
-            "FROM tiles WHERE zoom_level BETWEEN 7 AND ?",
-            (max_zoom,)
-          )
-          
-          # Java reads 'short date' (2 bytes) + 'int size' (4 bytes) per entry.
-          # Use source file age like mapcreator does (days since epoch).
-          source_pbf = '/tmp/gis-data/source.osm.pbf'
+
+          # Generate basemap with native Trekarta encoder.
+          subprocess.run([
+            'python3', '/tmp/mapcreator/mapwrite.py',
+            '-l', 'INFO', '-f', '-p', map_target,
+            '-1', '-1'
+          ], check=True)
+
+          # Determine z7 area tiles from source OSM bbox.
+          info = subprocess.check_output(['osmium', 'fileinfo', source_pbf], text=True)
+          m = re.search(r'Box:\s*\(([-0-9.]+),([-0-9.]+),([-0-9.]+),([-0-9.]+)\)', info)
+          if not m:
+            raise RuntimeError('Failed to read source bbox from osmium fileinfo output')
+
+          west, south, east, north = map(float, m.groups())
+          z7_tiles = {(t.x, t.y) for t in mercantile.tiles(west, south, east, north, [7])}
+          if not z7_tiles:
+            raise RuntimeError('No z7 tiles found for source bbox')
+
+          # Generate native tiles for each z7 area.
+          for x, y in sorted(z7_tiles):
+            subprocess.run([
+              'python3', '/tmp/mapcreator/mapwrite.py',
+              '-l', 'INFO', '-f', '-p', map_target,
+              str(x), str(y)
+            ], check=True)
+
+          # mapwrite outputs under maps/7/<x>/<x>-<y>.mtiles, move to maps/<x>/<x>-<y>.mtiles
+          for src_path in glob.glob(f'{map_target}/7/*/*.mtiles'):
+            x_dir = os.path.basename(os.path.dirname(src_path))
+            dst_dir = f'{map_target}/{x_dir}'
+            os.makedirs(dst_dir, exist_ok=True)
+            shutil.move(src_path, f'{dst_dir}/{os.path.basename(src_path)}')
+
+          if os.path.isdir(f'{map_target}/7'):
+            shutil.rmtree(f'{map_target}/7')
+
+          # Cleanup intermediate files generated by mapwrite.
+          for pattern in ('*.log', '*.osm.pbf', '*.o5m'):
+            for junk in glob.glob(f'{map_target}/**/{pattern}', recursive=True):
+              try:
+                os.remove(junk)
+              except OSError:
+                pass
+
+          # Java reads short date (2 bytes) + unsigned int size (4 bytes) per entry.
           date_short = int(os.path.getmtime(source_pbf) // 86400)
           tile_map = {}
-          dbs = {}
-
-          def get_area_db(area_x, area_y):
-            key = (area_x, area_y)
-            if key in dbs:
-              return dbs[key]
-            tile_dir = f"{map_target}/{area_x}"
-            os.makedirs(tile_dir, exist_ok=True)
-            tile_path = f"{tile_dir}/{area_x}-{area_y}.mtiles"
-            dst = sqlite3.connect(tile_path)
-            dst.execute("CREATE TABLE IF NOT EXISTS tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB)")
-            dst.execute("CREATE TABLE IF NOT EXISTS metadata (name TEXT, value TEXT)")
-            dst.execute("CREATE TABLE IF NOT EXISTS names (ref INTEGER NOT NULL, name TEXT NOT NULL)")
-            dst.execute("CREATE TABLE IF NOT EXISTS feature_names (id INTEGER NOT NULL, lang INTEGER NOT NULL, name INTEGER NOT NULL)")
-            dst.execute("CREATE TABLE IF NOT EXISTS features (id INTEGER NOT NULL, kind INTEGER, type INTEGER, lat REAL, lon REAL, opening_hours TEXT, phone TEXT, wikipedia TEXT, website TEXT, flags INTEGER, enum1 INTEGER)")
-            dst.execute("CREATE UNIQUE INDEX IF NOT EXISTS coord ON tiles (zoom_level, tile_column, tile_row)")
-            dst.execute("CREATE UNIQUE INDEX IF NOT EXISTS property ON metadata (name)")
-            dst.execute("CREATE UNIQUE INDEX IF NOT EXISTS name_ref ON names (ref)")
-            dst.execute("CREATE UNIQUE INDEX IF NOT EXISTS feature_name_lang ON feature_names (id, lang)")
-            dst.execute("CREATE UNIQUE INDEX IF NOT EXISTS feature_id ON features (id)")
-            dst.execute("INSERT OR REPLACE INTO metadata VALUES ('name', ?)", (f"{area_x}-{area_y}",))
-            dst.execute("INSERT OR REPLACE INTO metadata VALUES ('type', 'baselayer')")
-            dst.execute("INSERT OR REPLACE INTO metadata VALUES ('version', '3')")
-            dst.execute("INSERT OR REPLACE INTO metadata VALUES ('timestamp', ?)", (str(date_short),))
-            dst.execute("INSERT OR REPLACE INTO metadata VALUES ('format', 'maptrek')")
-            dbs[key] = (dst, tile_path)
-            return dbs[key]
-          
-          for (z, x, tms_y, data) in cursor:
-            y_xyz = (2**z - 1) - tms_y
-            # Group all subtiles into Trekarta's zoom-7 area bucket.
-            shift = z - 7
-            area_x = x >> shift
-            area_y = y_xyz >> shift
-            dst, tile_path = get_area_db(area_x, area_y)
-            # Trekarta map tiles use XYZ row indexing.
-            dst.execute("REPLACE INTO tiles VALUES (?, ?, ?, ?)", (z, x, y_xyz, data))
-
-          for (area_x, area_y), (dst, tile_path) in dbs.items():
-            dst.commit()
-            dst.close()
-            tile_map[(area_x, area_y)] = os.path.getsize(tile_path)
-          
-          src.close()
+          for tile_path in glob.glob(f'{map_target}/*/*.mtiles'):
+            name = os.path.basename(tile_path)
+            m = re.match(r'^(\d+)-(\d+)\.mtiles$', name)
+            if not m:
+              continue
+            x = int(m.group(1))
+            y = int(m.group(2))
+            tile_map[(x, y)] = os.path.getsize(tile_path)
           
           # Index format: short date (2 bytes) + unsigned int size (4 bytes) = 6 bytes per entry
           index_path = f"{map_target}/index"
@@ -257,10 +241,11 @@ jobs:
         run: |
           mkdir -p /tmp/gh-pages/maps
           mkdir -p /tmp/gh-pages/hillshades
-          cp -r /tmp/maps-output/maps/* /tmp/gh-pages/maps/
+          cp /tmp/maps-output/maps/index /tmp/gh-pages/maps/index
+          cd /tmp/maps-output/maps
+          find . -mindepth 2 -maxdepth 2 -name "*.mtiles" -exec cp --parents {} /tmp/gh-pages/maps/ \;
           cp -r /tmp/maps-output/hillshades/* /tmp/gh-pages/hillshades/
-          # Copy bundled basemap so the download URL resolves
-          cp app/src/main/assets/databases/basemap.mtiles /tmp/gh-pages/maps/basemap.mtiles
+          cp /tmp/maps-output/maps/basemap.mtiles /tmp/gh-pages/maps/basemap.mtiles
           
           TILE_COUNT=$(find /tmp/gh-pages/maps -name "*.mtiles" | wc -l)
           BUILD_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
